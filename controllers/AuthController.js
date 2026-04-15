@@ -1,6 +1,7 @@
 const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/emailService');
+const cloudinary = require('../config/cloudinary');
 
 // Generate JWT token
 const generateToken = (userId) => {
@@ -452,6 +453,80 @@ exports.resetPassword = async (req, res) => {
       success: false,
       message: 'Failed to reset password. Please try again.'
     });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET PROFILE IMAGE UPLOAD SIGNATURE
+// GET /api/auth/profile-image-signature
+// Returns signed Cloudinary params so the client can upload a profile image directly
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getProfileImageSignature = async (req, res) => {
+  try {
+    const timestamp = Math.round(Date.now() / 1000);
+    const folder    = `truevision/profiles/${req.user.id}`;
+    const paramsToSign = { folder, timestamp };
+    const signature = cloudinary.utils.api_sign_request(paramsToSign, process.env.CLOUDINARY_SECRET_KEY);
+
+    return res.status(200).json({
+      success: true,
+      signature,
+      timestamp,
+      folder,
+      api_key:    process.env.CLOUDINARY_API_KEY,
+      cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    });
+  } catch (err) {
+    console.error('getProfileImageSignature error:', err);
+    return res.status(500).json({ success: false, message: 'Could not generate upload signature' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UPDATE PROFILE
+// PUT /api/auth/profile
+// Body: { fullName, username, bio, country, profileImageUrl }
+// ─────────────────────────────────────────────────────────────────────────────
+exports.updateProfile = async (req, res) => {
+  try {
+    const { fullName, username, bio, country, profileImageUrl } = req.body;
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    // Check username uniqueness only if it changed
+    if (username && username.toLowerCase() !== user.username) {
+      const taken = await User.findOne({ username: username.toLowerCase() });
+      if (taken) return res.status(400).json({ success: false, message: 'Username is already taken' });
+    }
+
+    if (fullName !== undefined)        user.fullName     = fullName.trim();
+    if (username !== undefined)        user.username     = username.toLowerCase().trim();
+    if (bio !== undefined)             user.bio          = bio.trim();
+    if (country !== undefined)         user.country      = country.trim();
+    if (profileImageUrl !== undefined) user.profileImage = profileImageUrl;
+
+    await user.save();
+
+    const safeUser = {
+      _id:          user._id,
+      fullName:     user.fullName,
+      username:     user.username,
+      email:        user.email,
+      bio:          user.bio,
+      country:      user.country,
+      profileImage: user.profileImage,
+      role:         user.role,
+      isVerified:   user.isVerified,
+    };
+
+    return res.status(200).json({
+      success: true,
+      message: 'Profile updated successfully',
+      data:    { user: safeUser },
+    });
+  } catch (err) {
+    console.error('updateProfile error:', err);
+    return res.status(500).json({ success: false, message: err.message || 'Failed to update profile' });
   }
 };
 

@@ -14,6 +14,8 @@ router.post('/forgot-password', authController.forgotPassword);
 router.post('/reset-password', authController.resetPassword);
 
 // Protected routes (WITH protect middleware)
-router.get('/me', protect, authController.getMe);
+router.get('/me',                        protect, authController.getMe);
+router.get('/profile-image-signature',   protect, authController.getProfileImageSignature);
+router.put('/profile',                   protect, authController.updateProfile);
 
 module.exports = router;

@@ -256,7 +256,7 @@ const getVerificationEmailHTML = (fullName, otp) => `
         padding: 30px 20px;
       }
       .otp-code {
-        font-size: 42px;
+        font-size: 32px;
         letter-spacing: 10px;
       }
       .greeting {

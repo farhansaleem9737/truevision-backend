@@ -41,7 +41,17 @@ const userSchema = new mongoose.Schema({
   },
   profileImage: {
     type: String,
-    default: null
+    default: null,
+  },
+  profileImagePublicId: {
+    type: String,
+    default: null,      // Cloudinary public_id — used to delete old image on update
+  },
+  bio: {
+    type: String,
+    default: '',
+    maxlength: [150, 'Bio cannot exceed 150 characters'],
+    trim: true,
   },
   role: {
     type: String,
