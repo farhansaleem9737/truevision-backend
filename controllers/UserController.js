@@ -23,6 +23,34 @@ const safeUser = (u) => ({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SEARCH USERS
+// GET /api/users/search?q=keyword
+// ─────────────────────────────────────────────────────────────────────────────
+exports.searchUsers = async (req, res) => {
+  try {
+    const q = (req.query.q || '').trim();
+    if (q.length < 1) return ok(res, { users: [] });
+
+    const regex = new RegExp(q, 'i');
+    const users = await User.find({
+      _id: { $ne: req.user.id }, // exclude self
+      $or: [
+        { username: regex },
+        { fullName: regex },
+      ],
+    })
+      .select('fullName username profileImage bio')
+      .limit(20)
+      .lean();
+
+    return ok(res, { users });
+  } catch (err) {
+    console.error('searchUsers error:', err);
+    return fail(res, 'Search failed', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET CURRENT USER PROFILE
 // GET /api/users/me
 // ─────────────────────────────────────────────────────────────────────────────

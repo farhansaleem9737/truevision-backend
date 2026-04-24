@@ -1,12 +1,16 @@
 require("dotenv").config();
 const express = require("express");
+const http    = require("http");
 const cors = require("cors");
 const connectDB = require("./config/database");
 const authRoutes  = require("./routes/AuthRoutes");
 const videoRoutes = require("./routes/VideoRoutes");
 const userRoutes  = require("./routes/UserRoutes");
+const chatRoutes  = require("./routes/ChatRoutes");
+const { initSocket } = require("./socket");
 
-const app = express();
+const app    = express();
+const server = http.createServer(app);
 
 // Connect to MongoDB
 connectDB();
@@ -21,19 +25,27 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── CORS — allow all dev origins (mobile LAN IP + localhost) ─────────────────
-const ALLOWED_ORIGINS = [
-  'http://localhost:3000',
-  'http://localhost:8081',
-  'http://127.0.0.1:8081',
-  process.env.FRONTEND_URL,
-].filter(Boolean);
+// ── CORS — flexible for dev, strict for prod ────────────────────────────────
+const IS_PROD = process.env.NODE_ENV === 'production';
 
 app.use(
   cors({
     origin: (origin, cb) => {
-      // Allow requests with no origin (mobile apps, curl) and listed origins
-      if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      // Mobile apps send no origin — always allow
+      if (!origin) return cb(null, true);
+
+      if (IS_PROD) {
+        // Production: only allow explicit frontend URL
+        const allowed = [process.env.FRONTEND_URL].filter(Boolean);
+        if (allowed.includes(origin)) return cb(null, true);
+        return cb(new Error(`CORS: origin ${origin} not allowed`));
+      }
+
+      // Development: allow any localhost / LAN IP (192.168.x.x, 10.x.x.x, 172.x.x.x)
+      if (/^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?$/.test(origin)) {
+        return cb(null, true);
+      }
+
       cb(new Error(`CORS: origin ${origin} not allowed`));
     },
     credentials: true,
@@ -81,6 +93,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use("/api/auth",   rateLimit(30, 15 * 60 * 1000), authRoutes);
 app.use("/api/videos", rateLimit(200, 60 * 1000),     videoRoutes);
 app.use("/api/users",  rateLimit(100, 60 * 1000),     userRoutes);
+app.use("/api/chats",  rateLimit(200, 60 * 1000),     chatRoutes);
 
 // Health check
 app.get("/health", (req, res) => {
@@ -99,10 +112,13 @@ app.use((err, req, res, next) => {
   });
 });
 
+// ── Initialize Socket.IO ─────────────────────────────────────────────────────
+initSocket(server);
+
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
 
-module.exports = app;
+module.exports = { app, server };

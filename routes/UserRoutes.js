@@ -4,11 +4,16 @@ const router     = express.Router();
 const { protect }  = require('../middleware/Auth');
 const {
   getMe,
+  searchUsers,
   getProfileImageSignature,
   updateProfileImage,
   removeProfileImage,
   updateProfile,
 } = require('../controllers/UserController');
+
+// ── Search ────────────────────────────────────────────────────────────────────
+// GET  /api/users/search?q=keyword   — find users by name or username
+router.get('/search', protect, searchUsers);
 
 // ── Current user ─────────────────────────────────────────────────────────────
 // GET  /api/users/me                  — fetch own full profile

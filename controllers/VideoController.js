@@ -155,7 +155,7 @@ exports.getFeed = async (req, res) => {
         { $lookup: { from: 'users', localField: 'userId', foreignField: '_id',
             as: 'userId',
             pipeline: [{ $project: { username: 1, fullName: 1, profileImage: 1 } }] } },
-        { $unwind: { path: '$userId', preserveNullAndEmpty: true } },
+        { $unwind: { path: '$userId', preserveNullAndEmptyArrays: true } },
       ];
       const videos = await Video.aggregate(pipeline);
       return ok(res, { videos, pagination: { page: 1, limit, total: videos.length, pages: 1 } });
