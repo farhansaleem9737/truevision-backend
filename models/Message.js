@@ -42,7 +42,16 @@ const messageSchema = new mongoose.Schema({
     default: null,
   },
 
-  // Read receipts
+  // Delivery status — three-state progression: sent → delivered → seen
+  status: {
+    type:    String,
+    enum:    ['sent', 'delivered', 'seen'],
+    default: 'sent',
+    index:   true,
+  },
+  deliveredAt: { type: Date, default: null },
+
+  // Read receipts (kept for dual-write during migration — derives from status='seen')
   seen:   { type: Boolean, default: false },
   seenAt: { type: Date,    default: null },
 

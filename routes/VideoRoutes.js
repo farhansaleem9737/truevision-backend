@@ -12,7 +12,10 @@ const {
   getUserVideos,
   updateVideo,
   deleteVideo,
+  togglePin,
   searchVideos,
+  searchHashtags,
+  recomputeRankings,
   toggleLike,
   toggleSave,
   toggleRepost,
@@ -57,8 +60,16 @@ router.post('/create', protect, createVideo);
 // GET    /api/videos/feed            — Paginated public feed
 router.get('/feed', getFeed);
 
+// POST   /api/videos/admin/recompute-rankings  — Backfill ranking scores
+//        Optional: ?ai=true to call Gemini on un-analysed videos
+//        Admin role required.
+router.post('/admin/recompute-rankings', protect, recomputeRankings);
+
 // GET    /api/videos/search          — Search videos by keyword
 router.get('/search', searchVideos);
+
+// GET    /api/videos/search/hashtags — Search hashtags (aggregated from tags)
+router.get('/search/hashtags', searchHashtags);
 
 // GET    /api/videos/saved           — Current user's saved videos (auth required)
 router.get('/saved',     protect, getSavedVideos);
@@ -80,6 +91,9 @@ router.put('/:id', protect, updateVideo);
 
 // DELETE /api/videos/:id             — Delete video (owner / admin)
 router.delete('/:id', protect, deleteVideo);
+
+// PUT    /api/videos/:id/pin         — Pin/unpin to creator profile (owner only)
+router.put('/:id/pin', protect, togglePin);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // VIDEO — SOCIAL ACTIONS  (all auth required)

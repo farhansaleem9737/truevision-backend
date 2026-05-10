@@ -61,7 +61,14 @@ const videoSchema = new mongoose.Schema({
   }],
   category: {
     type:    String,
-    enum:    ['entertainment', 'education', 'music', 'sports', 'gaming', 'food', 'travel', 'fashion', 'tech', 'other'],
+    enum:    [
+      // Informative / educational
+      'education', 'tech', 'programming', 'business', 'finance',
+      'islamic', 'motivation', 'news', 'productivity',
+      // Legacy / lifestyle
+      'entertainment', 'music', 'sports', 'gaming', 'food', 'travel', 'fashion',
+      'other',
+    ],
     default: 'other',
   },
 
@@ -134,6 +141,34 @@ const videoSchema = new mongoose.Schema({
     ref:     'Comment',
     default: null,
   },
+
+  // ── Pinned to creator's profile (sorts to top of /user/:userId feed) ────
+  pinned: {
+    type:    Boolean,
+    default: false,
+    index:   true,
+  },
+  pinnedAt: {
+    type:    Date,
+    default: null,
+  },
+
+  // ── Content-quality ranking ────────────────────────────────────────────
+  // Computed by services/contentRanking.js + (optionally) Gemini AI.
+  // rankingScore drives the Trending feed order; recompute periodically as
+  // engagement metrics change.
+  aiCategory: {
+    type: String,
+    enum: ['technical', 'educational', 'business', 'finance', 'motivational',
+           'news', 'islamic', 'entertainment', 'music', 'other', null],
+    default: null,
+  },
+  informativeScore: { type: Number, default: 0, min: 0, max: 10 },  // 0–10 from AI (or tag-derived fallback)
+  tagScore:         { type: Number, default: 0 },                    // weighted tag count
+  engagementScore:  { type: Number, default: 0 },                    // computed from views/likes/etc.
+  rankingScore:     { type: Number, default: 0, index: true },       // weighted combo; sorted DESC for trending
+  aiAnalyzedAt:     { type: Date,   default: null },                  // last time AI classifier ran
+  rankingUpdatedAt: { type: Date,   default: null },                  // last time engagement → ranking ran
 
   // ── Reports ───────────────────────────────────────────────────────────────
   reports:      [reportSchema],

@@ -1,5 +1,6 @@
 // Backend/controllers/UserController.js
 const User       = require('../models/User');
+const Video      = require('../models/Video');
 const cloudinary = require('../config/cloudinary');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -8,7 +9,48 @@ const cloudinary = require('../config/cloudinary');
 const ok   = (res, data, code = 200) => res.status(code).json({ success: true,  ...data });
 const fail = (res, msg,  code = 400) => res.status(code).json({ success: false, message: msg });
 
-const safeUser = (u) => ({
+const DEFAULT_PREFS = {
+  privacy: {
+    privateAccount:   false,
+    hideOnlineStatus: false,
+    hideFollowers:    false,
+    whoCanMessage:    'everyone',  // 'everyone' | 'followers' | 'nobody'
+    whoCanComment:    'everyone',
+  },
+  notifications: {
+    likes:           true,
+    comments:        true,
+    newFollowers:    true,
+    messages:        true,
+    mentions:        true,
+    appUpdates:      true,
+    emailSecurity:   true,
+    emailNewsletter: false,
+    emailPromotions: false,
+    emailWeekly:     false,
+  },
+  content: {
+    autoplay:         true,
+    hdOnWifi:         true,
+    dataSaver:        false,
+    personalizedRecs: true,
+    hideSensitive:    false,
+    interestedTopics: [],
+  },
+  language: 'en',
+};
+
+// Recursive deep-merge that lets the client patch nested preferences.
+const deepMerge = (target, patch) => {
+  if (typeof target !== 'object' || target === null) return patch;
+  if (typeof patch  !== 'object' || patch  === null) return patch;
+  if (Array.isArray(patch)) return patch;
+  const out = { ...target };
+  for (const k of Object.keys(patch)) out[k] = deepMerge(target[k], patch[k]);
+  return out;
+};
+
+const safeUser = (u, extras = {}) => ({
   _id:                  u._id,
   fullName:             u.fullName,
   username:             u.username,
@@ -20,6 +62,10 @@ const safeUser = (u) => ({
   role:                 u.role,
   isVerified:           u.isVerified,
   createdAt:            u.createdAt,
+  followersCount:       u.followers?.length || 0,
+  followingCount:       u.following?.length || 0,
+  preferences:          deepMerge(DEFAULT_PREFS, u.preferences || {}),
+  ...extras,
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -58,7 +104,14 @@ exports.getMe = async (req, res) => {
   try {
     const user = await User.findById(req.user.id);
     if (!user) return fail(res, 'User not found', 404);
-    return ok(res, { user: safeUser(user) });
+
+    // Count this user's videos that aren't soft-deleted
+    const totalVideos = await Video.countDocuments({
+      userId: req.user.id,
+      status: { $ne: 'deleted' },
+    });
+
+    return ok(res, { user: safeUser(user, { totalVideos }) });
   } catch (err) {
     console.error('getMe error:', err);
     return fail(res, 'Failed to fetch profile', 500);
@@ -219,5 +272,35 @@ exports.updateProfile = async (req, res) => {
   } catch (err) {
     console.error('updateProfile error:', err);
     return fail(res, err.message || 'Failed to update profile', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UPDATE PREFERENCES (privacy / notifications / content / language)
+// PUT /api/users/preferences
+// Body: partial preferences object — deep-merged with existing.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.updatePreferences = async (req, res) => {
+  try {
+    const patch = req.body || {};
+    if (typeof patch !== 'object' || Array.isArray(patch)) {
+      return fail(res, 'Body must be a preferences object');
+    }
+
+    const user = await User.findById(req.user.id);
+    if (!user) return fail(res, 'User not found', 404);
+
+    const merged = deepMerge(user.preferences || {}, patch);
+    user.preferences = merged;
+    user.markModified('preferences');
+    await user.save();
+
+    return ok(res, {
+      message:     'Preferences updated',
+      preferences: deepMerge(DEFAULT_PREFS, merged),
+    });
+  } catch (err) {
+    console.error('updatePreferences error:', err);
+    return fail(res, 'Failed to update preferences', 500);
   }
 };

@@ -145,7 +145,7 @@ exports.verifyEmail = async (req, res) => {
       data: {
         token,
         user: {
-          id: user._id,
+          _id: user._id,
           fullName: user.fullName,
           username: user.username,
           email: user.email,
@@ -286,7 +286,7 @@ exports.login = async (req, res) => {
       data: {
         token,
         user: {
-          id: user._id,
+          _id: user._id,
           fullName: user.fullName,
           username: user.username,
           email: user.email,
@@ -325,7 +325,7 @@ exports.getMe = async (req, res) => {
       success: true,
       data: {
         user: {
-          id: user._id,
+          _id: user._id,
           fullName: user.fullName,
           username: user.username,
           email: user.email,

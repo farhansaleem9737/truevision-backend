@@ -80,7 +80,30 @@ const userSchema = new mongoose.Schema({
   },
   lastLogin: {
     type: Date
-  }
+  },
+  isOnline: {
+    type: Boolean,
+    default: false,
+    index: true,
+  },
+  lastSeen: {
+    type: Date,
+    default: null,
+  },
+  followers: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+  }],
+  following: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+  }],
+  // Preferences blob — privacy, notifications, content, language.
+  // Mixed type lets the client send partial updates that the controller deep-merges.
+  preferences: {
+    type: mongoose.Schema.Types.Mixed,
+    default: () => ({}),
+  },
 }, {
   timestamps: true
 });

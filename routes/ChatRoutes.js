@@ -5,6 +5,7 @@ const { protect } = require('../middleware/Auth');
 const {
   getMyChats,
   createOrGetChat,
+  createGroup,
   getMessages,
   sendMessage,
   markAsRead,
@@ -12,8 +13,9 @@ const {
 } = require('../controllers/ChatController');
 
 // ── Chat list ────────────────────────────────────────────────────────────────
-router.get('/',      protect, getMyChats);        // GET  /api/chats
-router.post('/',     protect, createOrGetChat);    // POST /api/chats  { userId }
+router.get('/',       protect, getMyChats);        // GET  /api/chats
+router.post('/',      protect, createOrGetChat);   // POST /api/chats        { userId }     — 1-on-1
+router.post('/group', protect, createGroup);       // POST /api/chats/group  { memberIds, groupName, groupImage? }
 
 // ── Messages within a chat ───────────────────────────────────────────────────
 router.get('/:chatId/messages',  protect, getMessages);  // GET  /api/chats/:chatId/messages?page=1

@@ -1,9 +1,12 @@
 // Backend/controllers/VideoController.js
 const Video                                                       = require('../models/Video');
+const Repost                                                      = require('../models/Repost');
 const cloudinary                                                  = require('../config/cloudinary');
 const { uploadToCloudinary, deleteFromCloudinary,
         buildQualityUrls, buildThumbnailUrl }       = require('../middleware/upload');
 const { checkContent }                                            = require('../utils/contentFilter');
+const { scoreVideo }                                              = require('../services/contentRanking');
+const { classifyContent }                                         = require('../services/geminiClassifier');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
@@ -125,6 +128,22 @@ exports.createVideo = async (req, res) => {
       status: 'active',
     });
 
+    // Fire-and-forget content analysis. Don't block the upload response on
+    // Gemini latency / availability — the ranking system has a tag-based
+    // fallback that runs synchronously below.
+    runContentAnalysis(video).catch((e) => console.error('runContentAnalysis error:', e));
+
+    // Synchronous tag/engagement ranking so the video has *some* score from
+    // the moment it's saved. AI score will overwrite informativeScore once
+    // the async Gemini call returns.
+    const initial = scoreVideo(video);
+    video.tagScore        = initial.tagScore;
+    video.engagementScore = initial.engagementScore;
+    video.informativeScore = initial.informativeScore;
+    video.rankingScore    = initial.rankingScore;
+    video.rankingUpdatedAt = new Date();
+    await video.save().catch(() => {});
+
     return ok(res, { message: 'Video uploaded successfully', video }, 201);
   } catch (err) {
     console.error('createVideo error:', err);
@@ -144,7 +163,13 @@ exports.getFeed = async (req, res) => {
     const category = req.query.category;
 
     const match = { status: 'active', visibility: 'public', isReported: { $ne: true } };
-    if (category && category !== 'all') match.category = category;
+    if (category && category !== 'all') {
+      // Accept comma-separated values for multi-category filter
+      // (e.g. "education,tech,business" for the "For You" tab)
+      const list = String(category).split(',').map((s) => s.trim()).filter(Boolean);
+      if (list.length > 1)      match.category = { $in: list };
+      else if (list.length === 1) match.category = list[0];
+    }
     if (req.user?.id) match.notInterested = { $nin: [req.user.id] };
 
     if (sort === 'random') {
@@ -162,7 +187,10 @@ exports.getFeed = async (req, res) => {
     }
 
     const sortMap = {
-      trending: { viewsCount: -1, likesCount: -1 },
+      // Ranking algorithm-driven trending: combo of informativeScore, tagScore,
+      // engagementScore — sorted DESC, with createdAt as a secondary key so two
+      // equally-ranked videos surface the fresher one.
+      trending: { rankingScore: -1, createdAt: -1 },
       new:      { createdAt: -1 },
     };
     const sortQuery = sortMap[sort] || sortMap.new;
@@ -178,8 +206,10 @@ exports.getFeed = async (req, res) => {
       Video.countDocuments(match),
     ]);
 
+    const enriched = await markReposts(videos, req.user?.id);
+
     return ok(res, {
-      videos,
+      videos: enriched,
       pagination: { page, limit, total, pages: Math.ceil(total / limit) },
     });
   } catch (err) {
@@ -187,6 +217,21 @@ exports.getFeed = async (req, res) => {
     return fail(res, 'Failed to fetch feed', 500);
   }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// markReposts — annotate a list of plain video docs with isReposted=true/false
+// for the current viewer. Single round-trip to the Repost collection.
+// ─────────────────────────────────────────────────────────────────────────────
+async function markReposts(videos, viewerId) {
+  if (!viewerId || !videos?.length) {
+    return (videos || []).map((v) => ({ ...v, isReposted: false }));
+  }
+  const ids = videos.map((v) => v._id).filter(Boolean);
+  const rows = await Repost.find({ userId: viewerId, videoId: { $in: ids } })
+    .select('videoId').lean();
+  const set = new Set(rows.map((r) => r.videoId.toString()));
+  return videos.map((v) => ({ ...v, isReposted: set.has(v._id.toString()) }));
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET SINGLE VIDEO
@@ -224,16 +269,21 @@ exports.getUserVideos = async (req, res) => {
 
     const [videos, total] = await Promise.all([
       Video.find(filter)
-        .sort({ createdAt: -1 })
+        .sort({ pinned: -1, pinnedAt: -1, createdAt: -1 })
         .skip(skip)
         .limit(limit)
         .select('-views -notInterested -reports -likes -saves -reposts -favorites')
+        // Populate the uploader so the player shows the real creator's
+        // username + profile image instead of a generic placeholder.
+        .populate('userId', 'username fullName profileImage isVerified')
         .lean(),
       Video.countDocuments(filter),
     ]);
 
+    const enriched = await markReposts(videos, req.user?.id);
+
     return ok(res, {
-      videos,
+      videos: enriched,
       pagination: { page, limit, total, pages: Math.ceil(total / limit) },
     });
   } catch (err) {
@@ -314,6 +364,78 @@ exports.deleteVideo = async (req, res) => {
   } catch (err) {
     console.error('deleteVideo error:', err);
     return fail(res, 'Delete failed', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TOGGLE PIN — pin/unpin a video to the owner's profile
+// PUT /api/videos/:id/pin
+// Body (optional): { pinned: boolean }   if omitted, current value is flipped
+// Owner-only.
+// ─────────────────────────────────────────────────────────────────────────────
+const MAX_PINNED = 3;
+
+exports.togglePin = async (req, res) => {
+  try {
+    const video = await Video.findById(req.params.id);
+    if (!video || video.status === 'deleted') return fail(res, 'Video not found', 404);
+    if (!video.userId.equals(req.user.id))     return fail(res, 'Only the owner can pin this video', 403);
+
+    const next = typeof req.body?.pinned === 'boolean' ? req.body.pinned : !video.pinned;
+
+    if (next) {
+      const pinnedCount = await Video.countDocuments({
+        userId: req.user.id, pinned: true, status: 'active', _id: { $ne: video._id },
+      });
+      if (pinnedCount >= MAX_PINNED) {
+        return fail(res, `You can pin up to ${MAX_PINNED} videos. Unpin one first.`);
+      }
+    }
+
+    video.pinned   = next;
+    video.pinnedAt = next ? new Date() : null;
+    await video.save();
+
+    return ok(res, {
+      message: next ? 'Video pinned' : 'Video unpinned',
+      videoId: video._id,
+      pinned:  video.pinned,
+      pinnedAt: video.pinnedAt,
+    });
+  } catch (err) {
+    console.error('togglePin error:', err);
+    return fail(res, 'Failed to update pin', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SEARCH HASHTAGS — aggregates the `tags` array across active public videos.
+// GET /api/videos/search/hashtags?q=trav
+// Returns: [{ tag: 'travel', videosCount: 42 }, ...] sorted by frequency.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.searchHashtags = async (req, res) => {
+  try {
+    const q     = (req.query.q || '').trim().replace(/^#/, '');
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    if (q.length < 1) return ok(res, { hashtags: [] });
+
+    const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+
+    const rows = await Video.aggregate([
+      { $match: { status: 'active', visibility: 'public', tags: { $exists: true, $ne: [] } } },
+      { $unwind: '$tags' },
+      { $project: { tag: { $toLower: '$tags' } } },
+      { $match: { tag: re } },
+      { $group: { _id: '$tag', videosCount: { $sum: 1 } } },
+      { $sort: { videosCount: -1, _id: 1 } },
+      { $limit: limit },
+      { $project: { _id: 0, tag: '$_id', videosCount: 1 } },
+    ]);
+
+    return ok(res, { hashtags: rows });
+  } catch (err) {
+    console.error('searchHashtags error:', err);
+    return fail(res, 'Hashtag search failed', 500);
   }
 };
 
@@ -423,22 +545,78 @@ exports.toggleRepost = async (req, res) => {
     const video = await Video.findById(req.params.id);
     if (!video || video.status === 'deleted') return fail(res, 'Video not found', 404);
 
-    const uid      = req.user.id;
-    const reposted = video.isRepostedBy(uid);
+    const uid     = req.user.id;
+    const videoId = video._id;
 
-    if (reposted) {
-      video.reposts      = video.reposts.filter(id => !id.equals(uid));
-      video.repostsCount = Math.max(video.repostsCount - 1, 0);
+    // Toggle by attempting to delete first; insert only if no row existed.
+    const deleted = await Repost.deleteOne({ userId: uid, videoId });
+    let reposted;
+
+    if (deleted.deletedCount > 0) {
+      reposted = false;
+      video.repostsCount = Math.max((video.repostsCount || 0) - 1, 0);
     } else {
-      video.reposts.push(uid);
-      video.repostsCount += 1;
+      try {
+        await Repost.create({ userId: uid, videoId, originalOwnerId: video.userId });
+        reposted = true;
+        video.repostsCount = (video.repostsCount || 0) + 1;
+      } catch (err) {
+        // Race: another request just created the same row. Treat as already-reposted.
+        if (err.code === 11000) reposted = true;
+        else throw err;
+      }
     }
 
     await video.save();
-    return ok(res, { reposted: !reposted, repostsCount: video.repostsCount });
+    return ok(res, { reposted, repostsCount: video.repostsCount });
   } catch (err) {
     console.error('toggleRepost error:', err);
     return fail(res, 'Action failed', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET REPOSTS BY USER
+// GET /api/users/:userId/reposts?page=1&limit=30
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getUserReposts = async (req, res) => {
+  try {
+    const targetUserId = req.params.userId;
+    const page  = Math.max(parseInt(req.query.page)  || 1, 1);
+    const limit = Math.min(parseInt(req.query.limit) || 30, 50);
+    const skip  = (page - 1) * limit;
+
+    const [reposts, total] = await Promise.all([
+      Repost.find({ userId: targetUserId })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate({
+          path:   'videoId',
+          match:  { status: { $ne: 'deleted' } },
+          select: '-views -notInterested -reports -likes -saves -reposts -favorites',
+          populate: { path: 'userId', select: 'username fullName profileImage' },
+        })
+        .lean(),
+      Repost.countDocuments({ userId: targetUserId }),
+    ]);
+
+    // Drop entries whose original video was deleted (populate.match returns null)
+    const videos = reposts
+      .filter((r) => r.videoId)
+      .map((r) => ({
+        ...r.videoId,
+        repostedAt: r.createdAt,
+        isReposted: true,
+      }));
+
+    return ok(res, {
+      videos,
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+    });
+  } catch (err) {
+    console.error('getUserReposts error:', err);
+    return fail(res, 'Failed to fetch reposts', 500);
   }
 };
 
@@ -627,3 +805,89 @@ const buildCollection = (filter) => async (req, res) => {
 exports.getSavedVideos    = buildCollection(uid => ({ saves:     uid }));
 exports.getLikedVideos    = buildCollection(uid => ({ likes:     uid }));
 exports.getFavoriteVideos = buildCollection(uid => ({ favorites: uid }));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONTENT ANALYSIS
+// Called fire-and-forget after upload. Calls Gemini for category +
+// informativeScore, then recomputes the full ranking using contentRanking
+// helpers. Cheap to run when GEMINI_API_KEY is unset (skips the network call).
+// ─────────────────────────────────────────────────────────────────────────────
+async function runContentAnalysis(video) {
+  try {
+    const ai = await classifyContent({
+      title:       video.title,
+      description: video.description,
+      tags:        video.tags,
+    });
+
+    if (ai) {
+      video.aiCategory       = ai.category;
+      video.informativeScore = ai.informativeScore;
+      video.aiAnalyzedAt     = new Date();
+    }
+
+    const scores = scoreVideo(video, ai ? { informativeScore: ai.informativeScore } : {});
+    video.tagScore         = scores.tagScore;
+    video.engagementScore  = scores.engagementScore;
+    video.informativeScore = scores.informativeScore;
+    video.rankingScore     = scores.rankingScore;
+    video.rankingUpdatedAt = new Date();
+
+    await video.save();
+    return scores;
+  } catch (err) {
+    console.error('runContentAnalysis error:', err.message);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADMIN — recompute ranking scores for every active video
+// POST /api/videos/admin/recompute-rankings?ai=true|false
+//
+// Use this after schema changes, after tweaking weights, or to backfill
+// existing videos that pre-date the ranking system. Idempotent.
+//   ?ai=true  → call Gemini for every video that hasn't been analysed yet
+//   default   → tag + engagement only (fast, no API cost)
+// ─────────────────────────────────────────────────────────────────────────────
+exports.recomputeRankings = async (req, res) => {
+  try {
+    if (req.user?.role !== 'admin') return fail(res, 'Admin only', 403);
+
+    const useAi = String(req.query.ai || 'false') === 'true';
+    const videos = await Video.find({ status: 'active' });
+    let analysed = 0;
+    let aiCalls  = 0;
+
+    for (const video of videos) {
+      let aiResult = null;
+      if (useAi && !video.aiAnalyzedAt) {
+        aiResult = await classifyContent({
+          title: video.title, description: video.description, tags: video.tags,
+        });
+        if (aiResult) {
+          aiCalls++;
+          video.aiCategory       = aiResult.category;
+          video.informativeScore = aiResult.informativeScore;
+          video.aiAnalyzedAt     = new Date();
+        }
+      }
+      const scores = scoreVideo(video, aiResult ? { informativeScore: aiResult.informativeScore } : {});
+      video.tagScore         = scores.tagScore;
+      video.engagementScore  = scores.engagementScore;
+      video.informativeScore = scores.informativeScore;
+      video.rankingScore     = scores.rankingScore;
+      video.rankingUpdatedAt = new Date();
+      await video.save();
+      analysed++;
+    }
+
+    return ok(res, {
+      message:  `Recomputed ranking for ${analysed} videos`,
+      analysed, aiCalls,
+    });
+  } catch (err) {
+    console.error('recomputeRankings error:', err);
+    return fail(res, 'Recompute failed', 500);
+  }
+};

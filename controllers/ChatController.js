@@ -2,6 +2,7 @@
 const Chat    = require('../models/Chat');
 const Message = require('../models/Message');
 const User    = require('../models/User');
+const { onlineUsers } = require('../socket');
 
 const ok   = (res, data, code = 200) => res.status(code).json({ success: true, ...data });
 const fail = (res, msg,  code = 400) => res.status(code).json({ success: false, message: msg });
@@ -14,7 +15,7 @@ exports.getMyChats = async (req, res) => {
     const userId = req.user.id;
 
     const chats = await Chat.find({ members: userId })
-      .populate('members', 'fullName username profileImage')
+      .populate('members', 'fullName username profileImage isOnline lastSeen')
       .populate('lastMessage.senderId', 'username')
       .sort({ updatedAt: -1 })
       .lean();
@@ -51,19 +52,20 @@ exports.createOrGetChat = async (req, res) => {
     if (myId === otherId) return fail(res, 'Cannot create a chat with yourself');
 
     // Check other user exists
-    const otherUser = await User.findById(otherId).select('fullName username profileImage');
+    const otherUser = await User.findById(otherId).select('fullName username profileImage isOnline lastSeen');
     if (!otherUser) return fail(res, 'User not found', 404);
 
     // Find existing chat between these two users
     let chat = await Chat.findOne({
       members: { $all: [myId, otherId], $size: 2 },
-    }).populate('members', 'fullName username profileImage');
+    }).populate('members', 'fullName username profileImage isOnline lastSeen');
 
     if (!chat) {
-      // Create new chat
-      chat = await Chat.create({ members: [myId, otherId] });
+      // Create new 1-on-1 chat — explicitly typed so legacy queries that
+      // ignore `type` still treat existing chats as 'single'.
+      chat = await Chat.create({ type: 'single', members: [myId, otherId] });
       chat = await Chat.findById(chat._id)
-        .populate('members', 'fullName username profileImage');
+        .populate('members', 'fullName username profileImage isOnline lastSeen');
     }
 
     const other = chat.members.find(m => m._id.toString() !== myId);
@@ -80,6 +82,67 @@ exports.createOrGetChat = async (req, res) => {
   } catch (err) {
     console.error('createOrGetChat error:', err);
     return fail(res, 'Failed to create chat', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/chats/group — create a new group chat
+// Body: { memberIds: [userId, ...], groupName, groupImage? }
+// The current user is always added to members + recorded as createdBy.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.createGroup = async (req, res) => {
+  try {
+    const myId = req.user.id;
+    const { memberIds = [], groupName, groupImage = '' } = req.body || {};
+
+    const trimmedName = (groupName || '').trim();
+    if (!trimmedName)            return fail(res, 'Group name is required');
+    if (trimmedName.length > 80) return fail(res, 'Group name is too long (max 80)');
+
+    if (!Array.isArray(memberIds) || memberIds.length === 0) {
+      return fail(res, 'At least one other member is required');
+    }
+
+    // Dedupe + ensure creator is in members. Drop self if it appears in input.
+    const others  = [...new Set(memberIds.map(String))].filter((id) => id && id !== myId);
+    if (others.length === 0) return fail(res, 'Please add at least one other member');
+
+    // Validate that those users exist
+    const found = await User.find({ _id: { $in: others } }).select('_id');
+    if (found.length !== others.length) {
+      return fail(res, 'One or more selected users do not exist');
+    }
+
+    const allMembers = [myId, ...others];
+
+    let chat = await Chat.create({
+      type:      'group',
+      members:   allMembers,
+      groupName: trimmedName,
+      groupImage,
+      createdBy: myId,
+    });
+
+    chat = await Chat.findById(chat._id)
+      .populate('members', 'fullName username profileImage isOnline lastSeen');
+
+    return ok(res, {
+      chat: {
+        _id:         chat._id,
+        type:        'group',
+        groupName:   chat.groupName,
+        groupImage:  chat.groupImage,
+        createdBy:   chat.createdBy,
+        members:     chat.members,
+        membersCount: chat.members.length,
+        lastMessage: chat.lastMessage,
+        unreadCount: 0,
+        updatedAt:   chat.updatedAt,
+      },
+    }, 201);
+  } catch (err) {
+    console.error('createGroup error:', err);
+    return fail(res, 'Failed to create group', 500);
   }
 };
 
@@ -143,7 +206,11 @@ exports.sendMessage = async (req, res) => {
       return fail(res, 'Not a member of this chat', 403);
     }
 
-    // Create the message
+    // Create the message — if recipient has a live socket, flag as delivered immediately
+    const otherUserId = chat.members.find(m => m.toString() !== userId).toString();
+    const recipientOnline = onlineUsers?.has?.(otherUserId) || false;
+    const deliveredAt = recipientOnline ? new Date() : null;
+
     const message = await Message.create({
       chatId,
       senderId: userId,
@@ -151,6 +218,8 @@ exports.sendMessage = async (req, res) => {
       type,
       videoId:  type === 'video' ? videoId : null,
       imageUrl: type === 'image' ? imageUrl : null,
+      status:   recipientOnline ? 'delivered' : 'sent',
+      deliveredAt,
     });
 
     // Determine preview text for lastMessage
@@ -159,7 +228,6 @@ exports.sendMessage = async (req, res) => {
     if (type === 'image') preview = '📷 Sent an image';
 
     // Update chat lastMessage + bump unread for the OTHER user
-    const otherUserId = chat.members.find(m => m.toString() !== userId).toString();
     const currentUnread = chat.unreadCount?.get?.(otherUserId) || 0;
 
     chat.lastMessage = {
@@ -200,8 +268,8 @@ exports.markAsRead = async (req, res) => {
 
     // Mark all unseen messages from the OTHER user as seen
     await Message.updateMany(
-      { chatId, senderId: { $ne: userId }, seen: false },
-      { $set: { seen: true, seenAt: new Date() } },
+      { chatId, senderId: { $ne: userId }, status: { $ne: 'seen' } },
+      { $set: { status: 'seen', seen: true, seenAt: new Date() } },
     );
 
     // Reset unread counter for this user

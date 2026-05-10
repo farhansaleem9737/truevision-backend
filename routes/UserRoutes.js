@@ -9,7 +9,9 @@ const {
   updateProfileImage,
   removeProfileImage,
   updateProfile,
+  updatePreferences,
 } = require('../controllers/UserController');
+const { getUserReposts } = require('../controllers/VideoController');
 
 // ── Search ────────────────────────────────────────────────────────────────────
 // GET  /api/users/search?q=keyword   — find users by name or username
@@ -32,5 +34,11 @@ router.delete('/profile-image', protect, removeProfileImage);
 // ── Profile fields ────────────────────────────────────────────────────────────
 // PUT  /api/users/profile             — update fullName, username, bio, country
 router.put('/profile', protect, updateProfile);
+
+// PUT  /api/users/preferences         — privacy / notifications / content / language
+router.put('/preferences', protect, updatePreferences);
+
+// GET  /api/users/:userId/reposts     — list of videos this user has reposted
+router.get('/:userId/reposts', protect, getUserReposts);
 
 module.exports = router;
