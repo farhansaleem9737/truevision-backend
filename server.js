@@ -7,6 +7,8 @@ const authRoutes  = require("./routes/AuthRoutes");
 const videoRoutes = require("./routes/VideoRoutes");
 const userRoutes  = require("./routes/UserRoutes");
 const chatRoutes  = require("./routes/ChatRoutes");
+const aiRoutes       = require("./routes/AIRoutes");
+const activityRoutes = require("./routes/ActivityRoutes");
 const { initSocket } = require("./socket");
 
 const app    = express();
@@ -94,6 +96,8 @@ app.use("/api/auth",   rateLimit(30, 15 * 60 * 1000), authRoutes);
 app.use("/api/videos", rateLimit(200, 60 * 1000),     videoRoutes);
 app.use("/api/users",  rateLimit(100, 60 * 1000),     userRoutes);
 app.use("/api/chats",  rateLimit(200, 60 * 1000),     chatRoutes);
+app.use("/api/ai",       rateLimit(60,  60 * 1000), aiRoutes);
+app.use("/api/activity", rateLimit(200, 60 * 1000), activityRoutes);
 
 // Health check
 app.get("/health", (req, res) => {
@@ -116,9 +120,25 @@ app.use((err, req, res, next) => {
 initSocket(server);
 
 const PORT = process.env.PORT || 5000;
+// Explicit 0.0.0.0 binds to every network interface so phones/devices on
+// the same Wi-Fi can reach the server via the host machine's LAN IP, not
+// just localhost. (Node's default is also 0.0.0.0 but being explicit
+// removes ambiguity when diagnosing "connection refused" reports.)
+const HOST = process.env.HOST || '0.0.0.0';
 
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`🚀 Server running on ${HOST}:${PORT}`);
+  // Print every IPv4 address the server can be reached on — handy when
+  // pointing a phone or emulator at the dev backend.
+  try {
+    const nets = require('os').networkInterfaces();
+    Object.values(nets).flat().forEach((n) => {
+      if (n && n.family === 'IPv4' && !n.internal) {
+        console.log(`   • http://${n.address}:${PORT}`);
+      }
+    });
+    console.log(`   • http://localhost:${PORT}  (same machine only)`);
+  } catch (_) { /* network introspection is optional */ }
 });
 
 module.exports = { app, server };

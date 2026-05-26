@@ -75,18 +75,28 @@ const safeUser = (u, extras = {}) => ({
 exports.searchUsers = async (req, res) => {
   try {
     const q = (req.query.q || '').trim();
-    if (q.length < 1) return ok(res, { users: [] });
 
-    const regex = new RegExp(q, 'i');
-    const users = await User.find({
-      _id: { $ne: req.user.id }, // exclude self
-      $or: [
-        { username: regex },
-        { fullName: regex },
-      ],
-    })
-      .select('fullName username profileImage bio')
-      .limit(20)
+    // Always exclude self. When q is empty we still return a list — the chat
+    // screen uses this to show "people you can chat with" before the user has
+    // any conversations. With a query we filter by username / fullName regex.
+    const filter = { _id: { $ne: req.user.id } };
+    if (q.length > 0) {
+      // Escape regex metacharacters so a username with "." or "*" doesn't blow up
+      const safe = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(safe, 'i');
+      filter.$or = [{ username: regex }, { fullName: regex }];
+    }
+
+    // No query → show recently-active users first so the empty-state list
+    // feels useful. With a query, sort by username so matches are stable.
+    const sort = q.length > 0
+      ? { username: 1 }
+      : { lastSeen: -1, createdAt: -1 };
+
+    const users = await User.find(filter)
+      .select('fullName username profileImage bio isVerified isOnline lastSeen')
+      .sort(sort)
+      .limit(q.length > 0 ? 20 : 30)
       .lean();
 
     return ok(res, { users });

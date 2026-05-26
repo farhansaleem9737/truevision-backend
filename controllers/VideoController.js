@@ -7,6 +7,9 @@ const { uploadToCloudinary, deleteFromCloudinary,
 const { checkContent }                                            = require('../utils/contentFilter');
 const { scoreVideo }                                              = require('../services/contentRanking');
 const { classifyContent }                                         = require('../services/geminiClassifier');
+const { classifyCloudinaryVideo }                                 = require('../services/nsfwModeration');
+const WatchHistory                                                = require('../models/WatchHistory');
+const SharedVideo                                                 = require('../models/SharedVideo');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
@@ -99,6 +102,32 @@ exports.createVideo = async (req, res) => {
       return fail(res, 'Your content violates our community guidelines.', 422);
     }
 
+    // ── NSFW MODERATION ────────────────────────────────────────────────────
+    // Sample frames from the Cloudinary-hosted video and classify each
+    // locally via NudeNet (see services/nsfwModeration.js). Block PORN/NSFW
+    // outcomes; pass-through on inference failure (fallback flag set).
+    const moderation = await classifyCloudinaryVideo({ publicId, duration });
+    if (moderation.status === 'PORN' || moderation.status === 'NSFW') {
+      await deleteFromCloudinary(publicId, 'video').catch(() => {});
+
+      // User-facing wording: short label + retry hint. We never expose the
+      // raw "PORN" string or the confidence number to the uploader — those
+      // remain in the JSON response (moderation.status, moderation.confidence)
+      // for server logs and any future admin tooling.
+      const reason = moderation.status === 'PORN'
+        ? 'Video failed due to adult content detection.'
+        : 'Video failed due to explicit content detection.';
+
+      return res.status(422).json({
+        success: false,
+        moderation: {
+          status:     moderation.status,
+          confidence: moderation.confidence,
+        },
+        message: `${reason} Please upload a different video.`,
+      });
+    }
+
     const thumbnailUrl = buildThumbnailUrl(publicId);
     const qualities    = buildQualityUrls(publicId);
 
@@ -144,7 +173,15 @@ exports.createVideo = async (req, res) => {
     video.rankingUpdatedAt = new Date();
     await video.save().catch(() => {});
 
-    return ok(res, { message: 'Video uploaded successfully', video }, 201);
+    return ok(res, {
+      message: 'Video uploaded successfully',
+      video,
+      moderation: {
+        status:     moderation.status,
+        confidence: moderation.confidence,
+        ...(moderation.fallback ? { fallback: true } : {}),
+      },
+    }, 201);
   } catch (err) {
     console.error('createVideo error:', err);
     return fail(res, err.message || 'Failed to save video', 500);
@@ -681,7 +718,8 @@ exports.recordView = async (req, res) => {
     const video = await Video.findById(req.params.id);
     if (!video || video.status === 'deleted') return fail(res, 'Video not found', 404);
 
-    const watchTime = parseInt(req.body.watchTime) || 0;
+    const watchTime    = parseInt(req.body.watchTime)    || 0;
+    const lastPosition = parseInt(req.body.lastPosition) || 0;
 
     if (req.user) {
       if (!video.hasViewedBy(req.user.id)) {
@@ -693,6 +731,26 @@ exports.recordView = async (req, res) => {
     }
 
     await video.save();
+
+    // Mirror to WatchHistory so the "My Activity → Watch History" screen has
+    // data. Upsert: re-watching the same video bumps watchedAt + replaces
+    // position/duration instead of duplicating the row. Best-effort —
+    // failure here must not break view recording.
+    if (req.user) {
+      WatchHistory.findOneAndUpdate(
+        { userId: req.user.id, videoId: video._id },
+        {
+          $set: {
+            watchedAt:     new Date(),
+            lastPosition:  Math.max(0, lastPosition),
+            watchDuration: Math.max(0, watchTime),
+          },
+          $setOnInsert: { userId: req.user.id, videoId: video._id },
+        },
+        { upsert: true },
+      ).catch((e) => console.error('WatchHistory upsert failed:', e.message));
+    }
+
     return ok(res, { viewsCount: video.viewsCount });
   } catch (err) {
     console.error('recordView error:', err);
@@ -739,6 +797,19 @@ exports.shareVideo = async (req, res) => {
       { new: true },
     );
     if (!video || video.status === 'deleted') return fail(res, 'Video not found', 404);
+
+    // Mirror to SharedVideo for the "My Activity → Shared Videos" list.
+    // Not deduped — every share event is its own row (timeline-style).
+    // Best-effort; we don't want a logging hiccup to fail the share itself.
+    if (req.user) {
+      const platform = String(req.body?.platform || 'system_share').slice(0, 40);
+      SharedVideo.create({
+        userId:   req.user.id,
+        videoId:  video._id,
+        platform,
+      }).catch((e) => console.error('SharedVideo write failed:', e.message));
+    }
+
     return ok(res, { sharesCount: video.sharesCount });
   } catch (err) {
     console.error('shareVideo error:', err);

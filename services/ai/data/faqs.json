@@ -1,0 +1,62 @@
+[
+  {
+    "question": "How do I upload a video?",
+    "answer": "Tap the + button in the bottom tab bar, pick a video from your gallery or record one, add a title and category, and tap Upload. Videos go through automatic moderation and category classification before they appear in the feed."
+  },
+  {
+    "question": "Why was my upload blocked?",
+    "answer": "Uploads are blocked when our NSFW moderation flags adult or explicit content in any sampled frame. Choose different footage that follows the community guidelines and try again."
+  },
+  {
+    "question": "How does TrueVision categorize videos?",
+    "answer": "Every upload is run through a DistilBERT classifier that assigns one of four categories: Educational, Professional, News, or Entertainment. The category drives ranking and recommendations."
+  },
+  {
+    "question": "How does the recommendation feed work?",
+    "answer": "We score every candidate video on educational signal, watch-time, engagement, recency, and how well it matches your interests and watch history. Educational and Professional content gets a boost so the feed leans informative."
+  },
+  {
+    "question": "How do I edit or delete a comment?",
+    "answer": "Long-press your own comment to open the action sheet. Choose Edit to change the text or Delete to remove it. Only the comment's owner sees these options."
+  },
+  {
+    "question": "How do I change my profile picture?",
+    "answer": "Open the Profile tab, tap the avatar at the top of the screen, then choose Edit Profile and pick a new image from your gallery."
+  },
+  {
+    "question": "How do I enable dark mode?",
+    "answer": "Open Settings, then Display, and toggle Dark Mode. The choice is saved locally and survives app restarts."
+  },
+  {
+    "question": "How do I save a video for later?",
+    "answer": "Tap the bookmark icon on the right-hand action column while watching. Saved videos appear under Profile → Saved."
+  },
+  {
+    "question": "How do I report inappropriate content?",
+    "answer": "Open the three-dot menu on any video and choose Report. Pick a reason; videos with five or more reports are automatically hidden pending review."
+  },
+  {
+    "question": "What file formats can I upload?",
+    "answer": "TrueVision accepts MP4, MOV, WebM, and AVI files up to 500 MB. Longer clips are automatically compressed on the client before upload."
+  },
+  {
+    "question": "Why is my video processing slow?",
+    "answer": "Large or high-resolution videos are compressed on-device before upload to save bandwidth. Compression progress is shown in the upload screen — bigger files take longer."
+  },
+  {
+    "question": "How do I follow another creator?",
+    "answer": "Open their profile and tap Follow. Their latest uploads will appear in the Following tab on Home."
+  },
+  {
+    "question": "How do I find educational content?",
+    "answer": "The home feed already prioritizes Educational and Professional categories. You can also use the search tab to look for specific topics, hashtags, or creators."
+  },
+  {
+    "question": "Can I download videos?",
+    "answer": "Only when the creator has enabled downloads on that video. When allowed, the download icon on the action column unlocks; tap it to save a Cloudinary-signed copy to your device."
+  },
+  {
+    "question": "How do I sign out?",
+    "answer": "Settings → Account → Log Out. You'll be returned to the login screen and your token is cleared from the device."
+  }
+]
