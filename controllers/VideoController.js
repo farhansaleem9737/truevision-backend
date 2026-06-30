@@ -71,6 +71,43 @@ exports.getUploadSignature = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET ATTACHMENT UPLOAD SIGNATURE
+// GET /api/videos/attachment-signature?kind=image|raw
+//
+// Signs a direct-to-Cloudinary upload for source-evidence / news attachments
+// (images, PDFs, docs). Same pattern as getUploadSignature but routes to a
+// per-user attachments/ subfolder and uses resource_type 'image' or 'raw'
+// (Cloudinary stores PDFs and other docs as 'raw').
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getAttachmentSignature = async (req, res) => {
+  try {
+    const kind         = (req.query.kind || 'raw').toString();
+    const resourceType = kind === 'image' ? 'image' : 'raw';
+
+    const timestamp = Math.round(Date.now() / 1000);
+    const folder    = `truevision/attachments/${req.user.id}`;
+    const paramsToSign = { folder, timestamp };
+
+    const signature = cloudinary.utils.api_sign_request(
+      paramsToSign,
+      process.env.CLOUDINARY_SECRET_KEY,
+    );
+
+    return ok(res, {
+      signature,
+      timestamp,
+      folder,
+      resourceType,
+      api_key:    process.env.CLOUDINARY_API_KEY,
+      cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    });
+  } catch (err) {
+    console.error('getAttachmentSignature error:', err);
+    return fail(res, 'Could not generate attachment signature', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CREATE VIDEO RECORD  (called after client finishes direct Cloudinary upload)
 // POST /api/videos/create
 // Body: { publicId, secureUrl, duration, bytes, format, width, height,
@@ -85,6 +122,13 @@ exports.createVideo = async (req, res) => {
       title, description = '', song = '', tags = '',
       category = 'other', visibility = 'public',
       allowDownload = true, allowComments = true, allowDuet = true,
+      // Content type + source attachments (all optional)
+      contentType   = null,
+      sourceUrl     = '',
+      sourceFiles   = [],
+      newsUrl       = '',
+      newsPublisher = '',
+      newsFiles     = [],
     } = req.body;
 
     if (!publicId || !secureUrl) return fail(res, 'Cloudinary upload result is missing');
@@ -134,6 +178,34 @@ exports.createVideo = async (req, res) => {
     // Safely coerce — body values can be boolean or string "true"/"false"
     const toBool = (v, def = true) => v === undefined ? def : v === 'false' ? false : !!v;
 
+    // ── Content type + source validation ────────────────────────────────────
+    // Type is optional. If provided it must be one of fact / news / opinion.
+    // Source-file arrays are sanitised to drop malformed entries (caller may
+    // post partial objects mid-upload). Opinion strips all source data.
+    const safeType = ['fact', 'news', 'opinion'].includes(contentType) ? contentType : null;
+    const sanitizeFiles = (arr) =>
+      (Array.isArray(arr) ? arr : [])
+        .filter((f) => f && typeof f.url === 'string' && f.url.length > 0)
+        .slice(0, 5)
+        .map((f) => ({
+          url:      String(f.url),
+          publicId: String(f.publicId || ''),
+          type:     ['image', 'pdf', 'document'].includes(f.type) ? f.type : 'document',
+          name:     String(f.name || '').slice(0, 200),
+          size:     Number(f.size) || 0,
+        }));
+
+    const safeSources = safeType === 'fact'
+      ? { sourceUrl: String(sourceUrl || '').trim().slice(0, 2048),
+          sourceFiles: sanitizeFiles(sourceFiles) }
+      : { sourceUrl: '', sourceFiles: [] };
+
+    const safeNews = safeType === 'news'
+      ? { newsUrl:       String(newsUrl || '').trim().slice(0, 2048),
+          newsPublisher: String(newsPublisher || '').trim().slice(0, 120),
+          newsFiles:     sanitizeFiles(newsFiles) }
+      : { newsUrl: '', newsPublisher: '', newsFiles: [] };
+
     const video = await Video.create({
       userId:    req.user.id,
       title:     title.trim(),
@@ -155,6 +227,9 @@ exports.createVideo = async (req, res) => {
       resolution: { width: Number(width) || 0, height: Number(height) || 0 },
       qualities,
       status: 'active',
+      contentType: safeType,
+      ...safeSources,
+      ...safeNews,
     });
 
     // Fire-and-forget content analysis. Don't block the upload response on
@@ -340,7 +415,9 @@ exports.updateVideo = async (req, res) => {
     if (!video.userId.equals(req.user.id)) return fail(res, 'Unauthorized', 403);
 
     const { title, description, tags, song, category, visibility,
-            allowDownload, allowComments, allowDuet } = req.body;
+            allowDownload, allowComments, allowDuet,
+            contentType, sourceUrl, sourceFiles,
+            newsUrl, newsPublisher, newsFiles } = req.body;
 
     // Re-run content filter on new text fields
     const newTags = tags
@@ -365,6 +442,32 @@ exports.updateVideo = async (req, res) => {
     if (allowDownload !== undefined) video.allowDownload = allowDownload;
     if (allowComments !== undefined) video.allowComments = allowComments;
     if (allowDuet     !== undefined) video.allowDuet     = allowDuet;
+
+    // Content classification + sources. Same sanitisation rules as createVideo.
+    if (contentType !== undefined) {
+      const safeType = ['fact', 'news', 'opinion'].includes(contentType) ? contentType : null;
+      video.contentType = safeType;
+      // Switching type clears the sibling slots so stale data doesn't linger.
+      if (safeType !== 'fact') { video.sourceUrl = ''; video.sourceFiles = []; }
+      if (safeType !== 'news') { video.newsUrl = ''; video.newsPublisher = ''; video.newsFiles = []; }
+    }
+    if (sourceUrl     !== undefined) video.sourceUrl     = String(sourceUrl).trim().slice(0, 2048);
+    if (newsUrl       !== undefined) video.newsUrl       = String(newsUrl).trim().slice(0, 2048);
+    if (newsPublisher !== undefined) video.newsPublisher = String(newsPublisher).trim().slice(0, 120);
+
+    const sanitizeFiles = (arr) =>
+      (Array.isArray(arr) ? arr : [])
+        .filter((f) => f && typeof f.url === 'string' && f.url.length > 0)
+        .slice(0, 5)
+        .map((f) => ({
+          url:      String(f.url),
+          publicId: String(f.publicId || ''),
+          type:     ['image', 'pdf', 'document'].includes(f.type) ? f.type : 'document',
+          name:     String(f.name || '').slice(0, 200),
+          size:     Number(f.size) || 0,
+        }));
+    if (sourceFiles !== undefined) video.sourceFiles = sanitizeFiles(sourceFiles);
+    if (newsFiles   !== undefined) video.newsFiles   = sanitizeFiles(newsFiles);
 
     await video.save();
     return ok(res, { message: 'Video updated', video });
@@ -737,18 +840,28 @@ exports.recordView = async (req, res) => {
     // position/duration instead of duplicating the row. Best-effort —
     // failure here must not break view recording.
     if (req.user) {
-      WatchHistory.findOneAndUpdate(
-        { userId: req.user.id, videoId: video._id },
-        {
-          $set: {
-            watchedAt:     new Date(),
-            lastPosition:  Math.max(0, lastPosition),
-            watchDuration: Math.max(0, watchTime),
+      // Save threshold: only insert/update once the viewer has actually
+      // watched some of the video. 3 seconds OR 10% — whichever comes first.
+      // Stops "scroll-past" videos from polluting Watch History.
+      const vidDur = Math.max(1, Number(video.duration) || 0);
+      const completion = Math.min(100, (Math.max(0, watchTime) / vidDur) * 100);
+      const meetsThreshold = watchTime >= 3 || completion >= 10;
+
+      if (meetsThreshold) {
+        WatchHistory.findOneAndUpdate(
+          { userId: req.user.id, videoId: video._id },
+          {
+            $set: {
+              watchedAt:            new Date(),
+              lastPlaybackPosition: Math.max(0, lastPosition),
+              watchDuration:        Math.max(0, watchTime),
+              completionPercentage: Math.max(0, Math.min(100, completion)),
+            },
+            $setOnInsert: { userId: req.user.id, videoId: video._id },
           },
-          $setOnInsert: { userId: req.user.id, videoId: video._id },
-        },
-        { upsert: true },
-      ).catch((e) => console.error('WatchHistory upsert failed:', e.message));
+          { upsert: true },
+        ).catch((e) => console.error('WatchHistory upsert failed:', e.message));
+      }
     }
 
     return ok(res, { viewsCount: video.viewsCount });

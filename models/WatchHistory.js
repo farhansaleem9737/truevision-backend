@@ -23,9 +23,10 @@ const watchHistorySchema = new mongoose.Schema(
       ref:      'Video',
       required: true,
     },
-    watchedAt:     { type: Date,   default: Date.now },
-    lastPosition:  { type: Number, default: 0 },   // seconds — for resume
-    watchDuration: { type: Number, default: 0 },   // seconds actually watched
+    watchedAt:             { type: Date,   default: Date.now },
+    lastPlaybackPosition:  { type: Number, default: 0 },   // seconds — for resume
+    watchDuration:         { type: Number, default: 0 },   // seconds actually watched
+    completionPercentage:  { type: Number, default: 0, min: 0, max: 100 }, // 0-100
   },
   { timestamps: true },
 );

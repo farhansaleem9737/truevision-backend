@@ -9,10 +9,11 @@ const { protect } = require('../middleware/Auth');
 const A = require('../controllers/ActivityController');
 
 // ── Watch History ───────────────────────────────────────────────────────────
-router.get   ('/watch-history',           protect, A.listWatch);
-router.post  ('/watch-history',           protect, A.recordWatch);
-router.delete('/watch-history',           protect, A.clearWatch);
-router.delete('/watch-history/:videoId',  protect, A.deleteWatch);
+router.get   ('/watch-history',              protect, A.listWatch);
+router.post  ('/watch-history',              protect, A.recordWatch);
+router.post  ('/watch-history/bulk-delete',  protect, A.bulkDeleteWatch);
+router.delete('/watch-history',              protect, A.clearWatch);
+router.delete('/watch-history/:videoId',     protect, A.deleteWatch);
 
 // ── Viewed Profiles ─────────────────────────────────────────────────────────
 router.get   ('/viewed-profiles',             protect, A.listProfileViews);

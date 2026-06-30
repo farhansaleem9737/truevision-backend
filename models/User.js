@@ -35,9 +35,30 @@ const userSchema = new mongoose.Schema({
   },
   password: {
     type: String,
-    required: [true, 'Password is required'],
+    // Required only for local accounts. Google-signed-in accounts may not
+    // have one set at first; the controller stamps a random placeholder so
+    // the field is never empty, but the user is steered to "Forgot Password"
+    // if they ever want a local credential.
+    required: function () { return this.authProvider === 'local'; },
     minlength: [8, 'Password must be at least 8 characters'],
     select: false
+  },
+  // ── OAuth (Google) ─────────────────────────────────────────────────────
+  // googleId is set when the user signs in with Google. We store it so that
+  // a second Google sign-in resolves to the same account even if email
+  // changes. Sparse index allows local accounts to omit this field.
+  googleId: {
+    type:   String,
+    index:  { sparse: true, unique: true },
+    select: false,
+  },
+  // Which sign-in flow created or last linked this account.
+  // 'local'  — email + password
+  // 'google' — Google OAuth (account may also have a local password if linked)
+  authProvider: {
+    type:    String,
+    enum:    ['local', 'google'],
+    default: 'local',
   },
   profileImage: {
     type: String,

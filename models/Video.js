@@ -175,6 +175,61 @@ const videoSchema = new mongoose.Schema({
   reportCount:  { type: Number, default: 0 },
   isReported:   { type: Boolean, default: false },
 
+  // ── Content classification (Fact / News / Opinion) ────────────────────────
+  // Optional self-declared label that drives the Info panel + source slots.
+  // Validated server-side; if absent the video is shown without a content-type chip.
+  contentType: {
+    type:    String,
+    enum:    ['fact', 'news', 'opinion', null],
+    default: null,
+    index:   true,
+  },
+
+  // ── Source / evidence (FACT) ─────────────────────────────────────────────
+  // All optional — videos publish fine with none. sourceFiles entries are
+  // Cloudinary-hosted attachments (image / pdf / doc) uploaded ahead of the
+  // video create call.
+  sourceUrl:   { type: String, trim: true, default: '' },
+  sourceFiles: [{
+    _id:      false,
+    url:      { type: String, required: true },   // Cloudinary secure_url
+    publicId: { type: String, default: '' },      // Cloudinary public_id (for deletion)
+    type:     { type: String, enum: ['image', 'pdf', 'document'], default: 'document' },
+    name:     { type: String, default: '' },      // user-friendly filename
+    size:     { type: Number, default: 0 },       // bytes (optional)
+  }],
+
+  // ── Source / publisher (NEWS) ─────────────────────────────────────────────
+  newsUrl:       { type: String, trim: true, default: '' },
+  newsPublisher: { type: String, trim: true, default: '', maxlength: 120 },
+  newsFiles: [{
+    _id:      false,
+    url:      { type: String, required: true },
+    publicId: { type: String, default: '' },
+    type:     { type: String, enum: ['image', 'pdf', 'document'], default: 'document' },
+    name:     { type: String, default: '' },
+    size:     { type: Number, default: 0 },
+  }],
+
+  // ── AI-readiness placeholders ────────────────────────────────────────────
+  // Schema-only — populated by future recommendation / verification models.
+  // Endpoints return them as-is; no business logic depends on them yet.
+  relatedContent:   [{ type: mongoose.Schema.Types.ObjectId, ref: 'Video' }],
+  relatedNews:      [{
+    _id:       false,
+    title:     { type: String, default: '' },
+    url:       { type: String, default: '' },
+    publisher: { type: String, default: '' },
+    addedAt:   { type: Date,   default: Date.now },
+  }],
+  semanticMatches: [{
+    _id:     false,
+    videoId: { type: mongoose.Schema.Types.ObjectId, ref: 'Video' },
+    score:   { type: Number, min: 0, max: 1 },
+  }],
+  verificationScore: { type: Number, min: 0, max: 1, default: null },
+  credibilityScore:  { type: Number, min: 0, max: 1, default: null },
+
 }, { timestamps: true });
 
 // ─────────────────────────────────────────────────────────────────────────────

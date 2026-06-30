@@ -6,6 +6,7 @@ const { upload } = require('../middleware/upload');
 
 const {
   getUploadSignature,
+  getAttachmentSignature,
   createVideo,
   getFeed,
   getVideoById,
@@ -47,10 +48,14 @@ const {
 // VIDEO — DIRECT CLOUDINARY UPLOAD (replaces old server-relay /upload route)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// POST   /api/videos/upload-signature  — Get signed params for direct Cloudinary upload
+// POST   /api/videos/upload-signature      — Get signed params for direct Cloudinary upload
 router.post('/upload-signature', protect, getUploadSignature);
 
-// POST   /api/videos/create            — Save video record after direct Cloudinary upload
+// GET    /api/videos/attachment-signature  — Sign upload for evidence/news files (image|raw)
+//        Query: ?kind=image|raw
+router.get('/attachment-signature', protect, getAttachmentSignature);
+
+// POST   /api/videos/create                — Save video record after direct Cloudinary upload
 router.post('/create', protect, createVideo);
 
 // ─────────────────────────────────────────────────────────────────────────────

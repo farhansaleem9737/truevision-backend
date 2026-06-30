@@ -39,20 +39,44 @@ const isObjectId = (s) => mongoose.Types.ObjectId.isValid(s);
 // ═════════════════════════════════════════════════════════════════════════════
 
 // POST /api/activity/watch-history
-//   Body: { videoId, lastPosition?, watchDuration? }
+//   Body: { videoId, lastPlaybackPosition?, watchDuration?, completionPercentage?, videoDuration? }
 // Upserts the row so re-watching bumps `watchedAt` without duplicating.
+//
+// `completionPercentage` is computed server-side if not sent: when
+// `videoDuration` is provided, percentage = watchDuration / videoDuration.
+// This lets the caller piggyback on /videos/:id/view without doing math.
 exports.recordWatch = async (req, res) => {
   try {
-    const { videoId, lastPosition = 0, watchDuration = 0 } = req.body;
+    const {
+      videoId,
+      // Accept both new + legacy field names so older clients still work.
+      lastPlaybackPosition,
+      lastPosition,
+      watchDuration       = 0,
+      completionPercentage,
+      videoDuration,
+    } = req.body;
     if (!isObjectId(videoId)) return fail(res, 'videoId is required');
+
+    const position = Math.max(0, Number(lastPlaybackPosition ?? lastPosition) || 0);
+    const duration = Math.max(0, Number(watchDuration) || 0);
+
+    // Compute completion from duration if not explicitly provided.
+    let completion = Number(completionPercentage);
+    if (!Number.isFinite(completion) && Number(videoDuration) > 0) {
+      completion = (duration / Number(videoDuration)) * 100;
+    }
+    if (!Number.isFinite(completion)) completion = 0;
+    completion = Math.max(0, Math.min(100, completion));
 
     await WatchHistory.findOneAndUpdate(
       { userId: req.user.id, videoId },
       {
         $set: {
-          watchedAt:     new Date(),
-          lastPosition:  Math.max(0, Number(lastPosition)  || 0),
-          watchDuration: Math.max(0, Number(watchDuration) || 0),
+          watchedAt:            new Date(),
+          lastPlaybackPosition: position,
+          watchDuration:        duration,
+          completionPercentage: completion,
         },
         $setOnInsert: { userId: req.user.id, videoId },
       },
@@ -62,6 +86,28 @@ exports.recordWatch = async (req, res) => {
   } catch (err) {
     console.error('recordWatch error:', err);
     return fail(res, 'Failed to record watch', 500);
+  }
+};
+
+// POST /api/activity/watch-history/bulk-delete
+//   Body: { ids: [<watchHistoryRowId>, ...] }
+// Bulk removal for the multi-select toolbar on the Watch History screen.
+exports.bulkDeleteWatch = async (req, res) => {
+  try {
+    const { ids } = req.body || {};
+    if (!Array.isArray(ids) || !ids.length) {
+      return fail(res, 'ids[] is required');
+    }
+    const validIds = ids.filter(isObjectId);
+    if (!validIds.length) return fail(res, 'no valid ids');
+    const r = await WatchHistory.deleteMany({
+      userId: req.user.id,
+      _id: { $in: validIds },
+    });
+    return ok(res, { deleted: r.deletedCount });
+  } catch (err) {
+    console.error('bulkDeleteWatch error:', err);
+    return fail(res, 'Bulk delete failed', 500);
   }
 };
 
@@ -85,11 +131,12 @@ exports.listWatch = async (req, res) => {
     const items = rows
       .filter((r) => r.videoId)
       .map((r) => ({
-        _id:           r._id,
-        video:         r.videoId,
-        watchedAt:     r.watchedAt,
-        lastPosition:  r.lastPosition,
-        watchDuration: r.watchDuration,
+        _id:                  r._id,
+        video:                r.videoId,
+        watchedAt:            r.watchedAt,
+        lastPlaybackPosition: r.lastPlaybackPosition || 0,
+        watchDuration:        r.watchDuration        || 0,
+        completionPercentage: r.completionPercentage || 0,
       }));
 
     return ok(res, {

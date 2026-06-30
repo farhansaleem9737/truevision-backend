@@ -1,7 +1,20 @@
 const User = require('../models/User');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const { OAuth2Client } = require('google-auth-library');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/emailService');
 const cloudinary = require('../config/cloudinary');
+
+// One client per process — used to verify ID tokens issued by Google.
+// We accept tokens minted for any of the three OAuth client IDs we register
+// in Google Cloud Console (iOS, Android, Web — Expo Go uses the Web one).
+const GOOGLE_AUDIENCES = [
+  process.env.GOOGLE_CLIENT_ID_IOS,
+  process.env.GOOGLE_CLIENT_ID_ANDROID,
+  process.env.GOOGLE_CLIENT_ID_WEB,
+].filter(Boolean);
+
+const googleClient = new OAuth2Client();
 
 // Generate JWT token
 const generateToken = (userId) => {
@@ -54,18 +67,32 @@ exports.register = async (req, res) => {
 
     // Send verification email
     const emailResult = await sendVerificationEmail(email, fullName, otp);
-    
+
     if (!emailResult.success) {
       console.error('Email sending failed:', emailResult.error);
-      // Still return success but notify about email issue
+
+      // ── DEV FALLBACK ────────────────────────────────────────────────────
+      // Email transport is broken (most commonly a stale Gmail App Password).
+      // To keep dev unblocked, print the OTP banner so you can verify the
+      // account by hand. REMOVE this block before going to production.
+      console.log('\n' + '═'.repeat(60));
+      console.log('  DEV FALLBACK — Email failed to send. Use this OTP:');
+      console.log('  Account: ' + email);
+      console.log('  OTP:     ' + otp);
+      console.log('  Expires: 15 minutes');
+      console.log('═'.repeat(60) + '\n');
+
       return res.status(201).json({
         success: true,
-        message: 'Registration successful! However, there was an issue sending the verification email. Please try resending.',
+        message: 'Registration successful! Email transport is offline — your verification code is shown in the server console.',
         data: {
-          userId: user._id,
-          email: user.email,
-          username: user.username,
-          emailSent: false
+          userId:    user._id,
+          email:     user.email,
+          username:  user.username,
+          emailSent: false,
+          // Exposing the OTP in the response only while NODE_ENV !== 'production'
+          // so the dev can paste it directly without checking the terminal.
+          ...(process.env.NODE_ENV !== 'production' ? { devOtp: otp } : {}),
         }
       });
     }
@@ -202,11 +229,18 @@ exports.resendOTP = async (req, res) => {
 
     // Send email
     const emailResult = await sendVerificationEmail(email, user.fullName, otp);
-    
+
     if (!emailResult.success) {
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to send verification email. Please try again.'
+      // DEV FALLBACK — log OTP to console + expose in body when not in prod
+      console.log('\n' + '═'.repeat(60));
+      console.log('  DEV FALLBACK — Resend OTP email failed. Use this:');
+      console.log('  Account: ' + email);
+      console.log('  OTP:     ' + otp);
+      console.log('═'.repeat(60) + '\n');
+      return res.status(200).json({
+        success: true,
+        message: 'Email transport is offline — your verification code is shown in the server console.',
+        ...(process.env.NODE_ENV !== 'production' ? { devOtp: otp } : {}),
       });
     }
 
@@ -307,6 +341,156 @@ exports.login = async (req, res) => {
   }
 };
 
+// @desc    Sign in / sign up with Google
+// @route   POST /api/auth/google
+// @access  Public
+//
+// Body: { idToken: string }
+//
+// The client (Expo app) goes through the OAuth flow with Google, receives an
+// id_token, and POSTs it here. We verify the token's signature + audience
+// against Google's public keys, then:
+//   • If a user with this googleId exists       → log them in.
+//   • Else if a user with this email exists     → link the Google account.
+//   • Else                                       → create a fresh account.
+// Either way we return the same { token, user } envelope as /login so the
+// client can store it identically through AuthContext.
+exports.googleSignIn = async (req, res) => {
+  try {
+    if (GOOGLE_AUDIENCES.length === 0) {
+      return res.status(503).json({
+        success: false,
+        message: 'Google sign-in is not configured on the server.',
+      });
+    }
+
+    const { idToken } = req.body;
+    if (!idToken) {
+      return res.status(400).json({
+        success: false,
+        message: 'idToken is required',
+      });
+    }
+
+    // 1) Verify the token's signature + audience with Google.
+    let payload;
+    try {
+      const ticket = await googleClient.verifyIdToken({
+        idToken,
+        audience: GOOGLE_AUDIENCES, // accept tokens for any of our configured clients
+      });
+      payload = ticket.getPayload();
+    } catch (err) {
+      console.error('Google token verify failed:', err.message);
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid Google sign-in token',
+      });
+    }
+
+    if (!payload?.email) {
+      return res.status(401).json({
+        success: false,
+        message: 'Google profile did not include an email',
+      });
+    }
+    // Google verifies emails before they're attached to a Google account, but
+    // double-check just in case (covers the rare "email_verified: false" case).
+    if (payload.email_verified === false) {
+      return res.status(401).json({
+        success: false,
+        message: 'Your Google email is not verified',
+      });
+    }
+
+    const googleId = payload.sub;          // stable Google user ID
+    const email    = payload.email.toLowerCase();
+    const fullName = payload.name || payload.given_name || 'Google User';
+    const picture  = payload.picture || null;
+
+    // 2) Try to find an existing account, in order of preference:
+    //    (a) same googleId  → returning Google user
+    //    (b) same email     → local account being linked
+    let user = await User.findOne({ googleId }).select('+googleId');
+    let isNew = false;
+
+    if (!user) {
+      user = await User.findOne({ email }).select('+googleId');
+
+      if (user) {
+        // Link: a local account exists with this email. Attach googleId so
+        // future Google sign-ins resolve here.
+        user.googleId = googleId;
+        if (user.authProvider === 'local') user.authProvider = 'google';
+        if (!user.profileImage && picture)  user.profileImage = picture;
+        user.isVerified = true; // Google has verified the email already.
+        await user.save();
+      } else {
+        // Create a new account. Username must be unique → derive from email
+        // and append a short random suffix if it collides.
+        const baseUsername = email.split('@')[0]
+          .toLowerCase()
+          .replace(/[^a-z0-9_]/g, '')
+          .slice(0, 24) || 'user';
+
+        let username = baseUsername;
+        for (let i = 0; i < 5; i++) {
+          if (!(await User.exists({ username }))) break;
+          username = `${baseUsername}_${crypto.randomBytes(2).toString('hex')}`;
+        }
+
+        user = await User.create({
+          fullName,
+          username,
+          email,
+          // We don't get a country from Google. Use a neutral default; the
+          // user can edit it from their profile screen.
+          country:      'Not specified',
+          // Random placeholder so the field is never empty. Google users can
+          // set a real password later via "Forgot Password".
+          password:     crypto.randomBytes(24).toString('hex'),
+          profileImage: picture,
+          googleId,
+          authProvider: 'google',
+          isVerified:   true,
+        });
+        isNew = true;
+      }
+    }
+
+    // 3) Bookkeeping + JWT, identical to the /login response envelope.
+    user.lastLogin = new Date();
+    await user.save();
+
+    const token = generateToken(user._id);
+
+    return res.status(200).json({
+      success: true,
+      message: isNew ? 'Account created with Google' : 'Signed in with Google',
+      data: {
+        token,
+        user: {
+          _id:          user._id,
+          fullName:     user.fullName,
+          username:     user.username,
+          email:        user.email,
+          country:      user.country,
+          profileImage: user.profileImage,
+          role:         user.role,
+          isVerified:   user.isVerified,
+          createdAt:    user.createdAt,
+        },
+      },
+    });
+  } catch (err) {
+    console.error('googleSignIn error:', err);
+    return res.status(500).json({
+      success: false,
+      message: 'Google sign-in failed. Please try again.',
+    });
+  }
+};
+
 // @desc    Get current user
 // @route   GET /api/auth/me
 // @access  Private
@@ -376,11 +560,18 @@ exports.forgotPassword = async (req, res) => {
 
     // Send email
     const emailResult = await sendPasswordResetEmail(email, user.fullName, otp);
-    
+
     if (!emailResult.success) {
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to send password reset email. Please try again.'
+      // DEV FALLBACK — log OTP to console + expose in body when not in prod
+      console.log('\n' + '═'.repeat(60));
+      console.log('  DEV FALLBACK — Reset-password email failed. Use this:');
+      console.log('  Account: ' + email);
+      console.log('  OTP:     ' + otp);
+      console.log('═'.repeat(60) + '\n');
+      return res.status(200).json({
+        success: true,
+        message: 'Email transport is offline — your reset code is shown in the server console.',
+        ...(process.env.NODE_ENV !== 'production' ? { devOtp: otp } : {}),
       });
     }
 
