@@ -2,7 +2,7 @@ const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { OAuth2Client } = require('google-auth-library');
-const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/emailService');
+const { sendVerificationEmail, sendPasswordResetEmail, sendTestEmail } = require('../services/emailService');
 const cloudinary = require('../config/cloudinary');
 
 // One client per process — used to verify ID tokens issued by Google.
@@ -65,35 +65,43 @@ exports.register = async (req, res) => {
     const otp = user.generateVerificationOTP();
     await user.save();
 
-    // Send verification email
+    // Send verification email. Failure behaviour depends on environment:
+    //   • production → roll back the user, return HTTP 500 (per spec)
+    //   • non-prod   → keep the user, log the OTP to the console + expose
+    //                  it in the response under `devOtp` so QA can keep
+    //                  testing while SMTP is being fixed.
     const emailResult = await sendVerificationEmail(email, fullName, otp);
 
     if (!emailResult.success) {
-      console.error('Email sending failed:', emailResult.error);
+      const isProd = process.env.NODE_ENV === 'production';
 
-      // ── DEV FALLBACK ────────────────────────────────────────────────────
-      // Email transport is broken (most commonly a stale Gmail App Password).
-      // To keep dev unblocked, print the OTP banner so you can verify the
-      // account by hand. REMOVE this block before going to production.
+      if (isProd) {
+        try { await User.deleteOne({ _id: user._id }); } catch (_) { /* ignore */ }
+        return res.status(500).json({
+          success: false,
+          message: 'We could not send your verification email. Please contact support or try again later.',
+        });
+      }
+
+      // Dev fallback — registration succeeds, OTP shown in console + body.
       console.log('\n' + '═'.repeat(60));
-      console.log('  DEV FALLBACK — Email failed to send. Use this OTP:');
+      console.log('  DEV FALLBACK — SMTP failed but user is created.');
       console.log('  Account: ' + email);
-      console.log('  OTP:     ' + otp);
-      console.log('  Expires: 15 minutes');
+      console.log('  OTP:     ' + otp + '   (15 min)');
+      console.log('  Fix SMTP → see /api/auth/test-email response.');
       console.log('═'.repeat(60) + '\n');
 
       return res.status(201).json({
         success: true,
-        message: 'Registration successful! Email transport is offline — your verification code is shown in the server console.',
+        message: 'Registration successful. Email transport is offline — the verification code is shown in the server console.',
         data: {
           userId:    user._id,
           email:     user.email,
           username:  user.username,
           emailSent: false,
-          // Exposing the OTP in the response only while NODE_ENV !== 'production'
-          // so the dev can paste it directly without checking the terminal.
-          ...(process.env.NODE_ENV !== 'production' ? { devOtp: otp } : {}),
-        }
+          devOtp:    otp,
+          smtpError: emailResult.error,
+        },
       });
     }
 
@@ -227,20 +235,26 @@ exports.resendOTP = async (req, res) => {
     const otp = user.generateVerificationOTP();
     await user.save();
 
-    // Send email
+    // Send email. Same environment-aware policy as register: prod fails
+    // hard, non-prod returns success with the OTP for local testing.
     const emailResult = await sendVerificationEmail(email, user.fullName, otp);
 
     if (!emailResult.success) {
-      // DEV FALLBACK — log OTP to console + expose in body when not in prod
+      const isProd = process.env.NODE_ENV === 'production';
+      if (isProd) {
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to send verification code. Please try again later.',
+        });
+      }
       console.log('\n' + '═'.repeat(60));
-      console.log('  DEV FALLBACK — Resend OTP email failed. Use this:');
-      console.log('  Account: ' + email);
-      console.log('  OTP:     ' + otp);
+      console.log('  DEV FALLBACK — Resend SMTP failed. OTP:', otp, '(account:', email + ')');
       console.log('═'.repeat(60) + '\n');
       return res.status(200).json({
-        success: true,
-        message: 'Email transport is offline — your verification code is shown in the server console.',
-        ...(process.env.NODE_ENV !== 'production' ? { devOtp: otp } : {}),
+        success:   true,
+        message:   'Email transport is offline — the verification code is shown in the server console.',
+        devOtp:    otp,
+        smtpError: emailResult.error,
       });
     }
 
@@ -558,20 +572,25 @@ exports.forgotPassword = async (req, res) => {
     const otp = user.generateResetPasswordOTP();
     await user.save();
 
-    // Send email
+    // Send email. Same environment-aware policy as register.
     const emailResult = await sendPasswordResetEmail(email, user.fullName, otp);
 
     if (!emailResult.success) {
-      // DEV FALLBACK — log OTP to console + expose in body when not in prod
+      const isProd = process.env.NODE_ENV === 'production';
+      if (isProd) {
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to send password reset code. Please try again later.',
+        });
+      }
       console.log('\n' + '═'.repeat(60));
-      console.log('  DEV FALLBACK — Reset-password email failed. Use this:');
-      console.log('  Account: ' + email);
-      console.log('  OTP:     ' + otp);
+      console.log('  DEV FALLBACK — Reset SMTP failed. OTP:', otp, '(account:', email + ')');
       console.log('═'.repeat(60) + '\n');
       return res.status(200).json({
-        success: true,
-        message: 'Email transport is offline — your reset code is shown in the server console.',
-        ...(process.env.NODE_ENV !== 'production' ? { devOtp: otp } : {}),
+        success:   true,
+        message:   'Email transport is offline — the reset code is shown in the server console.',
+        devOtp:    otp,
+        smtpError: emailResult.error,
       });
     }
 
@@ -719,6 +738,32 @@ exports.updateProfile = async (req, res) => {
     console.error('updateProfile error:', err);
     return res.status(500).json({ success: false, message: err.message || 'Failed to update profile' });
   }
+};
+
+// @desc    SMTP diagnostic — sends a single test email
+// @route   GET /api/auth/test-email[?to=somebody@example.com]
+// @access  Public (dev-only; lock down or remove before production)
+//
+// Useful when fighting Gmail App-Password issues. Returns the full error
+// detail on failure so you can see EAUTH / responseCode / response body
+// right in the API response, no log-spelunking needed.
+exports.testEmail = async (req, res) => {
+  const to = (req.query.to || '').toString().trim() || undefined;
+  const result = await sendTestEmail(to);
+  if (result.success) {
+    return res.status(200).json({
+      success:   true,
+      message:   'TrueVision email configuration is working successfully.',
+      messageId: result.messageId,
+      accepted:  result.accepted,
+      rejected:  result.rejected,
+    });
+  }
+  return res.status(500).json({
+    success: false,
+    message: 'SMTP test failed — see error details.',
+    error:   result.error,
+  });
 };
 
 module.exports = exports;

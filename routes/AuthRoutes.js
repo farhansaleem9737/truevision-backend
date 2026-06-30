@@ -11,6 +11,10 @@ router.post('/verify-email', authController.verifyEmail);
 router.post('/resend-otp', authController.resendOTP);
 router.post('/login', authController.login);
 router.post('/google', authController.googleSignIn);
+
+// SMTP diagnostic — leave mounted while you're stabilising email transport;
+// remove or guard with an admin role before going to production.
+router.get('/test-email', authController.testEmail);
 router.post('/forgot-password', authController.forgotPassword);
 router.post('/reset-password', authController.resetPassword);
 

@@ -1,24 +1,114 @@
 const nodemailer = require('nodemailer');
 
-// Create transporter with error handling
-const createTransporter = () => {
-  try {
-    return nodemailer.createTransport({
-      service: 'gmail',
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASSWORD
-      },
-      pool: true, // Use pooled connections
-      maxConnections: 5,
-      rateDelta: 1000,
-      rateLimit: 5
-    });
-  } catch (error) {
-    console.error('Failed to create email transporter:', error);
-    throw new Error('Email service configuration error');
+// ── Config readers ──────────────────────────────────────────────────────────
+// `dotenv.config()` MUST already have run by the time these are called. That
+// happens at the top of server.js (require('dotenv').config() is line 1) and
+// the transporter below is lazy-initialised, so we never read env vars before
+// they're populated.
+const readUser = () => (process.env.EMAIL_USER || '').trim();
+
+// Accept either EMAIL_PASS (per the canonical spec) or the legacy
+// EMAIL_PASSWORD that this project shipped with. Whitespace from copy-paste
+// is stripped defensively — Gmail's App-Password display uses spaces.
+const readPass = () => {
+  const raw = process.env.EMAIL_PASS || process.env.EMAIL_PASSWORD || '';
+  return raw.replace(/\s+/g, '');
+};
+
+// ── Lazy-initialised, cached, verified transporter ─────────────────────────
+// We hold one transporter for the whole process. It's created on first use
+// (so env vars are guaranteed loaded), verified against Gmail's SMTP, and
+// then reused. A failed verify throws — callers translate into a 5xx.
+let _transporter = null;
+let _verifyPromise = null;
+
+const buildTransporter = () => nodemailer.createTransport({
+  // Explicit smtp.gmail.com:465 + secure is more reliable than `service: gmail`
+  // — same endpoint, but Nodemailer doesn't have to look up service preset.
+  host:   'smtp.gmail.com',
+  port:   465,
+  secure: true,
+  auth: {
+    user: readUser(),
+    pass: readPass(),
+  },
+  // Pool reuses TCP connections; keeps register/resend bursts fast.
+  pool:           true,
+  maxConnections: 3,
+  maxMessages:    50,
+  // Tight timeouts so a hung connection fails the request quickly instead
+  // of stalling the user on the verify screen.
+  connectionTimeout: 10000,
+  greetingTimeout:   10000,
+  socketTimeout:     15000,
+});
+
+/**
+ * Get the live transporter, verifying credentials against Gmail on the very
+ * first call. Subsequent calls return the cached, verified instance.
+ * Throws a structured Error on any verify failure — see `formatSmtpError`.
+ */
+const getTransporter = async () => {
+  if (_transporter) return _transporter;
+  if (_verifyPromise) return _verifyPromise;
+
+  _verifyPromise = (async () => {
+    const t = buildTransporter();
+    try {
+      await t.verify();
+      _transporter = t;
+      console.log('[emailService] SMTP transporter verified — ready to send.');
+      return t;
+    } catch (err) {
+      _verifyPromise = null; // allow retry next call
+      throw err;
+    }
+  })();
+
+  return _verifyPromise;
+};
+
+/**
+ * Force a fresh verify next time. Useful after rotating EMAIL_PASS at runtime
+ * (you still need to restart Node for dotenv to pick up the new value, but
+ * this clears any stale cached transporter).
+ */
+const resetTransporter = () => {
+  if (_transporter) {
+    try { _transporter.close(); } catch (_) { /* swallow */ }
+  }
+  _transporter   = null;
+  _verifyPromise = null;
+};
+
+// ── Boot-time visibility ───────────────────────────────────────────────────
+// Tiny, secret-safe banner so devs can confirm the env reached the service.
+exports.logConfigStatus = () => {
+  const user = readUser();
+  const pass = readPass();
+  console.log('[emailService] Config check:');
+  console.log('  EMAIL_USER:    ', user || '(empty)');
+  console.log('  EMAIL_PASS:    ', pass ? `set (${pass.length} chars)` : 'MISSING');
+  if (pass && pass.length !== 16) {
+    console.warn('  ⚠️  Gmail App Passwords are exactly 16 chars — current length is ' + pass.length + '. Regenerate at https://myaccount.google.com/apppasswords');
   }
 };
+
+// ── Detailed SMTP error formatter ──────────────────────────────────────────
+// Surfaces every diagnostic Nodemailer hangs off the error object so backend
+// logs make the failure root-cause unambiguous.
+const formatSmtpError = (err) => ({
+  code:         err?.code,           // e.g. 'EAUTH', 'ESOCKET'
+  responseCode: err?.responseCode,   // e.g. 535
+  response:     err?.response,       // the full SMTP server reply
+  command:      err?.command,        // e.g. 'AUTH PLAIN'
+  message:      err?.message,
+  stack:        err?.stack,
+});
+
+exports._formatSmtpError = formatSmtpError; // exported for use in controllers / test route
+exports._resetTransporter = resetTransporter;
+exports._getTransporter   = getTransporter;
 
 // Modern, professional verification email template
 const getVerificationEmailHTML = (fullName, otp) => `
@@ -628,87 +718,82 @@ const getPasswordResetEmailHTML = (fullName, otp) => `
 </html>
 `;
 
-// Send verification email with error handling
+// Send verification email — uses the verified, cached transporter.
 exports.sendVerificationEmail = async (email, fullName, otp) => {
   try {
-    const transporter = createTransporter();
-    
-    const mailOptions = {
-      from: {
-        name: 'TrueVision',
-        address: process.env.EMAIL_USER
-      },
-      to: email,
-      subject: '🎬 Verify Your TrueVision Account',
-      html: getVerificationEmailHTML(fullName, otp),
-      text: `Welcome ${fullName}! Your TrueVision verification code is: ${otp}. This code expires in 15 minutes.`
-    };
+    const transporter = await getTransporter();
 
-    const info = await transporter.sendMail(mailOptions);
-    
-    console.log('Verification email sent successfully:', {
+    const info = await transporter.sendMail({
+      from:    { name: 'TrueVision', address: readUser() },
+      to:      email,
+      subject: '🎬 Verify Your TrueVision Account',
+      html:    getVerificationEmailHTML(fullName, otp),
+      text:    `Welcome ${fullName}! Your TrueVision verification code is: ${otp}. This code expires in 15 minutes.`,
+    });
+
+    console.log('[emailService] Verification email sent', {
       messageId: info.messageId,
-      email: email,
-      timestamp: new Date().toISOString()
+      to:        email,
+      accepted:  info.accepted,
+      rejected:  info.rejected,
     });
-    
-    return { 
-      success: true, 
-      messageId: info.messageId 
-    };
+    return { success: true, messageId: info.messageId };
   } catch (error) {
-    console.error('Failed to send verification email:', {
-      error: error.message,
-      email: email,
-      timestamp: new Date().toISOString()
-    });
-    
-    return { 
-      success: false, 
-      error: error.message 
-    };
+    const detail = formatSmtpError(error);
+    console.error('[emailService] sendVerificationEmail FAILED', { to: email, ...detail });
+    return { success: false, error: detail };
   }
 };
 
-// Send password reset email with error handling
+// Send password reset email — uses the verified, cached transporter.
 exports.sendPasswordResetEmail = async (email, fullName, otp) => {
   try {
-    const transporter = createTransporter();
-    
-    const mailOptions = {
-      from: {
-        name: 'TrueVision Security',
-        address: process.env.EMAIL_USER
-      },
-      to: email,
-      subject: '🔒 Reset Your TrueVision Password',
-      html: getPasswordResetEmailHTML(fullName, otp),
-      text: `Hi ${fullName}, your TrueVision password reset code is: ${otp}. This code expires in 15 minutes. If you didn't request this, please ignore this email.`
-    };
+    const transporter = await getTransporter();
 
-    const info = await transporter.sendMail(mailOptions);
-    
-    console.log('Password reset email sent successfully:', {
+    const info = await transporter.sendMail({
+      from:    { name: 'TrueVision Security', address: readUser() },
+      to:      email,
+      subject: '🔒 Reset Your TrueVision Password',
+      html:    getPasswordResetEmailHTML(fullName, otp),
+      text:    `Hi ${fullName}, your TrueVision password reset code is: ${otp}. This code expires in 15 minutes. If you didn't request this, please ignore this email.`,
+    });
+
+    console.log('[emailService] Password-reset email sent', {
       messageId: info.messageId,
-      email: email,
-      timestamp: new Date().toISOString()
+      to:        email,
+      accepted:  info.accepted,
+      rejected:  info.rejected,
     });
-    
-    return { 
-      success: true, 
-      messageId: info.messageId 
-    };
+    return { success: true, messageId: info.messageId };
   } catch (error) {
-    console.error('Failed to send password reset email:', {
-      error: error.message,
-      email: email,
-      timestamp: new Date().toISOString()
+    const detail = formatSmtpError(error);
+    console.error('[emailService] sendPasswordResetEmail FAILED', { to: email, ...detail });
+    return { success: false, error: detail };
+  }
+};
+
+// ── Diagnostic / test helper ───────────────────────────────────────────────
+// Used by the GET /api/auth/test-email route. Lets you confirm SMTP works
+// without going through the register flow.
+exports.sendTestEmail = async (toAddress) => {
+  try {
+    const transporter = await getTransporter();
+
+    const info = await transporter.sendMail({
+      from:    { name: 'TrueVision', address: readUser() },
+      to:      toAddress || readUser(),
+      subject: 'SMTP Test',
+      text:    'TrueVision email configuration is working successfully.',
+      html:    '<p style="font-family:system-ui;font-size:15px;color:#0f172a">'
+             + '<strong>TrueVision</strong> email configuration is working successfully.'
+             + '</p>',
     });
-    
-    return { 
-      success: false, 
-      error: error.message 
-    };
+    console.log('[emailService] Test email sent', { messageId: info.messageId, to: info.envelope?.to });
+    return { success: true, messageId: info.messageId, accepted: info.accepted, rejected: info.rejected };
+  } catch (error) {
+    const detail = formatSmtpError(error);
+    console.error('[emailService] sendTestEmail FAILED', { to: toAddress, ...detail });
+    return { success: false, error: detail };
   }
 };
 

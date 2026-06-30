@@ -1,4 +1,9 @@
+// dotenv MUST be the first line so every later `require(...)` sees the
+// resolved env. emailService relies on this — its transporter is lazy-
+// initialised on first use, but the config banner below confirms the env
+// reached the process at boot time.
 require("dotenv").config();
+
 const express = require("express");
 const http    = require("http");
 const cors = require("cors");
@@ -115,6 +120,11 @@ app.use((err, req, res, next) => {
     message: err.message || "Server Error",
   });
 });
+
+// ── Boot-time SMTP config visibility ────────────────────────────────────────
+// Doesn't open a connection — only prints whether EMAIL_USER / EMAIL_PASS
+// reached this process. Real verify happens on first email send (lazy).
+try { require('./services/emailService').logConfigStatus(); } catch (_) { /* optional */ }
 
 // ── Initialize Socket.IO ─────────────────────────────────────────────────────
 initSocket(server);
