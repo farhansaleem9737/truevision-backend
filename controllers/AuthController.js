@@ -740,6 +740,24 @@ exports.updateProfile = async (req, res) => {
   }
 };
 
+// @desc    Log out — revokes the caller's JWT via Redis so it can't be reused.
+// @route   POST /api/auth/logout
+// @access  Private (must have a valid Bearer token)
+//
+// The frontend can start calling this at any time; existing "just delete
+// the local token" logout still works, this simply adds server-side kill
+// on top so a compromised token becomes useless immediately.
+exports.logout = async (req, res) => {
+  try {
+    const { revokeToken } = require('../middleware/Auth');
+    if (req.authToken) await revokeToken(req.authToken);
+    return res.status(200).json({ success: true, message: 'Signed out.' });
+  } catch (err) {
+    console.error('logout error:', err);
+    return res.status(200).json({ success: true, message: 'Signed out.' });
+  }
+};
+
 // @desc    SMTP diagnostic — sends a single test email
 // @route   GET /api/auth/test-email[?to=somebody@example.com]
 // @access  Public (dev-only; lock down or remove before production)

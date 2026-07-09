@@ -125,6 +125,27 @@ const userSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.Mixed,
     default: () => ({}),
   },
+
+  // ── Chat / social state ────────────────────────────────────────────────
+  // Users this account has blocked. Messaging + presence queries filter
+  // both directions, so a blocked pair effectively becomes invisible.
+  blockedUsers: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref:  'User',
+  }],
+
+  // Verified-account badge (Instagram/Twitter-style). Reserved field —
+  // no self-serve flow yet; toggled manually or by a future review process.
+  isVerified: { type: Boolean, default: false, index: true },
+
+  // ── Push notifications ─────────────────────────────────────────────────
+  // Expo push tokens (ExponentPushToken[...]) — one per installed device.
+  // We store an array so the same account signed-in on multiple phones
+  // still gets notified on every device. Legacy `fcmTokens` are kept
+  // separately for a future dev-client / bare-workflow path (Firebase
+  // Messaging natively). Both are consulted when we fan out a push.
+  expoPushTokens: [{ type: String }],
+  fcmTokens:      [{ type: String }],
 }, {
   timestamps: true
 });
@@ -168,5 +189,20 @@ userSchema.methods.verifyOTP = function(otp, type = 'verification') {
   
   return { success: true };
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CACHE INVALIDATION HOOK — drops the user:byId:<id> entry so /users/me
+// returns fresh data after any profile / image / preferences change.
+// Lazy require avoids circular imports with services/cache.
+// ─────────────────────────────────────────────────────────────────────────────
+function invalidateUser(doc) {
+  if (!doc?._id) return;
+  try {
+    const cache = require('../services/cache');
+    cache.del(`user:byId:${doc._id}`).catch(() => {});
+  } catch (_) { /* cache is optional */ }
+}
+userSchema.post('save',             function (doc) { invalidateUser(doc); });
+userSchema.post('findOneAndUpdate', function (doc) { invalidateUser(doc); });
 
 module.exports = mongoose.model('User', userSchema);

@@ -2,6 +2,11 @@
 const User       = require('../models/User');
 const Video      = require('../models/Video');
 const cloudinary = require('../config/cloudinary');
+const cache      = require('../services/cache');
+const { resolveKind } = require('../services/cloudinaryFolders');
+
+const kUser = (id) => `user:byId:${id}`;
+const TTL_USER = 60; // 1 min — profile edits, follow counts change often
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
@@ -112,21 +117,31 @@ exports.searchUsers = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getMe = async (req, res) => {
   try {
-    const user = await User.findById(req.user.id);
-    if (!user) return fail(res, 'User not found', 404);
+    // Cache-aside — invalidated on any profile / image / preference update
+    // (see helper `invalidateUserCache` used by every write site below).
+    const payload = await cache.withCache(kUser(req.user.id), TTL_USER, async () => {
+      const user = await User.findById(req.user.id);
+      if (!user) return null;
 
-    // Count this user's videos that aren't soft-deleted
-    const totalVideos = await Video.countDocuments({
-      userId: req.user.id,
-      status: { $ne: 'deleted' },
+      const totalVideos = await Video.countDocuments({
+        userId: req.user.id,
+        status: { $ne: 'deleted' },
+      });
+
+      return safeUser(user, { totalVideos });
     });
 
-    return ok(res, { user: safeUser(user, { totalVideos }) });
+    if (!payload) return fail(res, 'User not found', 404);
+    return ok(res, { user: payload });
   } catch (err) {
     console.error('getMe error:', err);
     return fail(res, 'Failed to fetch profile', 500);
   }
 };
+
+// Central invalidator used by every write path (profile edit, image change,
+// preference update). Cheap enough to fire even when Redis is offline.
+const invalidateUserCache = (userId) => cache.del(kUser(String(userId))).catch(() => {});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET PROFILE IMAGE UPLOAD SIGNATURE
@@ -312,5 +327,85 @@ exports.updatePreferences = async (req, res) => {
   } catch (err) {
     console.error('updatePreferences error:', err);
     return fail(res, 'Failed to update preferences', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERAL-PURPOSE MEDIA UPLOAD SIGNATURE
+// GET /api/users/media-signature?kind=chat-image|chat-video|story-image|…
+//
+// Signs a Cloudinary upload for any of the folder classes the app now
+// supports (see services/cloudinaryFolders.js). Existing controller-scoped
+// signatures (profile, video, attachment) stay in place unchanged for
+// backward compat — this new endpoint just eliminates the need to add a
+// bespoke signature endpoint every time a new media class appears.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getMediaSignature = async (req, res) => {
+  try {
+    const kind = String(req.query.kind || '').trim();
+    const resolved = resolveKind(kind, req.user.id);
+    if (!resolved) return fail(res, `Unknown media kind "${kind}"`, 400);
+
+    const { folder, resourceType } = resolved;
+    const timestamp = Math.round(Date.now() / 1000);
+    const paramsToSign = { folder, timestamp };
+
+    const signature = cloudinary.utils.api_sign_request(
+      paramsToSign,
+      process.env.CLOUDINARY_SECRET_KEY,
+    );
+
+    return ok(res, {
+      signature,
+      timestamp,
+      folder,
+      resourceType,
+      api_key:    process.env.CLOUDINARY_API_KEY,
+      cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    });
+  } catch (err) {
+    console.error('getMediaSignature error:', err);
+    return fail(res, 'Could not generate upload signature', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUSH NOTIFICATIONS
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/users/push-token
+//   Body: { token, platform: 'expo' | 'fcm' }
+// Keeps a *set* of tokens per user so the same account across multiple
+// devices is properly notified. Old tokens self-expire when Expo/FCM
+// returns "DeviceNotRegistered" during a send (see pushService.js).
+exports.registerPushToken = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { token, platform = 'expo' } = req.body || {};
+    if (!token || typeof token !== 'string') return fail(res, 'token is required');
+    if (!['expo', 'fcm'].includes(platform))  return fail(res, 'invalid platform');
+
+    const field = platform === 'expo' ? 'expoPushTokens' : 'fcmTokens';
+    await User.updateOne({ _id: userId }, { $addToSet: { [field]: token } });
+    return ok(res, { message: 'Token registered' });
+  } catch (err) {
+    console.error('registerPushToken error:', err);
+    return fail(res, 'Failed to register token', 500);
+  }
+};
+
+// DELETE /api/users/push-token
+//   Body: { token, platform }
+exports.unregisterPushToken = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { token, platform = 'expo' } = req.body || {};
+    if (!token) return fail(res, 'token is required');
+
+    const field = platform === 'expo' ? 'expoPushTokens' : 'fcmTokens';
+    await User.updateOne({ _id: userId }, { $pull: { [field]: token } });
+    return ok(res, { message: 'Token removed' });
+  } catch (err) {
+    console.error('unregisterPushToken error:', err);
+    return fail(res, 'Failed to remove token', 500);
   }
 };

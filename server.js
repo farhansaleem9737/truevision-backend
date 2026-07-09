@@ -8,6 +8,7 @@ const express = require("express");
 const http    = require("http");
 const cors = require("cors");
 const connectDB = require("./config/database");
+const redis     = require("./config/redis");
 const authRoutes  = require("./routes/AuthRoutes");
 const videoRoutes = require("./routes/VideoRoutes");
 const userRoutes  = require("./routes/UserRoutes");
@@ -61,25 +62,11 @@ app.use(
   }),
 );
 
-// ── Basic in-memory rate limiter (no extra package needed) ────────────────────
-const rateLimitMap = new Map();
-const rateLimit = (maxReqs, windowMs) => (req, res, next) => {
-  const key  = req.ip || 'unknown';
-  const now  = Date.now();
-  const data = rateLimitMap.get(key) || { count: 0, start: now };
-  if (now - data.start > windowMs) { data.count = 0; data.start = now; }
-  data.count += 1;
-  rateLimitMap.set(key, data);
-  if (data.count > maxReqs) {
-    return res.status(429).json({ success: false, message: 'Too many requests — please slow down.' });
-  }
-  next();
-};
-// Clear stale entries every 10 minutes
-setInterval(() => {
-  const cutoff = Date.now() - 10 * 60 * 1000;
-  rateLimitMap.forEach((v, k) => { if (v.start < cutoff) rateLimitMap.delete(k); });
-}, 10 * 60 * 1000);
+// ── Rate limiter — Redis-backed, in-memory fallback ─────────────────────────
+// See middleware/rateLimit.js for the sliding-window algorithm. The Redis
+// path lets buckets survive restarts and be shared across processes; the
+// in-memory fallback keeps the same behaviour when Redis is offline.
+const rateLimit = require('./middleware/rateLimit');
 
 // ── Request logger ────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -97,12 +84,12 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Routes — auth endpoints are stricter (prevent brute-force)
-app.use("/api/auth",   rateLimit(30, 15 * 60 * 1000), authRoutes);
-app.use("/api/videos", rateLimit(200, 60 * 1000),     videoRoutes);
-app.use("/api/users",  rateLimit(100, 60 * 1000),     userRoutes);
-app.use("/api/chats",  rateLimit(200, 60 * 1000),     chatRoutes);
-app.use("/api/ai",       rateLimit(60,  60 * 1000), aiRoutes);
-app.use("/api/activity", rateLimit(200, 60 * 1000), activityRoutes);
+app.use("/api/auth",   rateLimit(30,  15 * 60 * 1000, 'auth'),   authRoutes);
+app.use("/api/videos", rateLimit(200, 60 * 1000,       'video'),  videoRoutes);
+app.use("/api/users",  rateLimit(100, 60 * 1000,       'user'),   userRoutes);
+app.use("/api/chats",  rateLimit(200, 60 * 1000,       'chat'),   chatRoutes);
+app.use("/api/ai",       rateLimit(60,  60 * 1000,     'ai'),       aiRoutes);
+app.use("/api/activity", rateLimit(200, 60 * 1000,     'activity'), activityRoutes);
 
 // Health check
 app.get("/health", (req, res) => {
@@ -125,6 +112,15 @@ app.use((err, req, res, next) => {
 // Doesn't open a connection — only prints whether EMAIL_USER / EMAIL_PASS
 // reached this process. Real verify happens on first email send (lazy).
 try { require('./services/emailService').logConfigStatus(); } catch (_) { /* optional */ }
+
+// ── Boot Redis (best-effort — server still starts if Redis is down) ────────
+// Every cache helper degrades to a pass-through when this fails.
+redis.boot().then(() => {
+  console.log(`[redis] URL: ${redis.REDIS_URL}  | ready: ${redis.isReady()}`);
+  // Counter-buffer flush loop — writes accumulated view/share deltas to
+  // Mongo every 30 s. No-op when Redis is down.
+  try { require('./services/counterBuffer').start(); } catch (_) { /* optional */ }
+});
 
 // ── Initialize Socket.IO ─────────────────────────────────────────────────────
 initSocket(server);

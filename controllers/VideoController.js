@@ -3,13 +3,33 @@ const Video                                                       = require('../
 const Repost                                                      = require('../models/Repost');
 const cloudinary                                                  = require('../config/cloudinary');
 const { uploadToCloudinary, deleteFromCloudinary,
-        buildQualityUrls, buildThumbnailUrl }       = require('../middleware/upload');
+        buildQualityUrls, buildThumbnailUrl,
+        buildEagerString }                          = require('../middleware/upload');
 const { checkContent }                                            = require('../utils/contentFilter');
 const { scoreVideo }                                              = require('../services/contentRanking');
 const { classifyContent }                                         = require('../services/geminiClassifier');
 const { classifyCloudinaryVideo }                                 = require('../services/nsfwModeration');
 const WatchHistory                                                = require('../models/WatchHistory');
 const SharedVideo                                                 = require('../models/SharedVideo');
+const cache                                                       = require('../services/cache');
+
+// ── Cache TTLs + key builders ────────────────────────────────────────────
+// Kept in one place so Phase-4 counter-flush + invalidation stay consistent.
+const TTL = {
+  feed:        30,    // 30 s — trending page turns quickly
+  videoById:   300,   // 5 min — invalidated on mutation
+  hashtag:     300,   // 5 min — trending tag list rarely changes
+};
+
+const kFeed      = ({ sort, category, page, limit, viewerId }) =>
+  `video:feed:${sort}:${category || 'all'}:${viewerId || 'anon'}:${page}:${limit}`;
+const kVideo     = (id)   => `video:byId:${id}`;
+const kHashtag   = (q,l)  => `video:hashtag:${(q||'').toLowerCase()}:${l}`;
+
+/** Wipe every cached feed permutation. Cheap enough to run on any Video mutation. */
+const invalidateFeed  = () => cache.delByPrefix('video:feed:*').catch(() => {});
+/** Drop a single video's cache after mutation. */
+const invalidateVideo = (id) => cache.del(kVideo(String(id))).catch(() => {});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
@@ -18,12 +38,16 @@ const ok   = (res, data, statusCode = 200) => res.status(statusCode).json({ succ
 const fail = (res, message, statusCode = 400) => res.status(statusCode).json({ success: false, message });
 
 const withUserFlags = (video, userId) => {
+  // Works on both mongoose Documents and lean POJOs so we can hydrate flags
+  // whether the doc came from Mongo or from the Redis cache.
   const v = video.toObject ? video.toObject() : { ...video };
   if (!userId) return v;
-  v.isLiked    = video.isLikedBy    ? video.isLikedBy(userId)    : false;
-  v.isSaved    = video.isSavedBy    ? video.isSavedBy(userId)    : false;
-  v.isReposted = video.isRepostedBy ? video.isRepostedBy(userId) : false;
-  v.isFavorited= video.isFavoritedBy? video.isFavoritedBy(userId): false;
+  const uid = String(userId);
+  const has = (arr) => Array.isArray(arr) && arr.some((id) => String(id) === uid);
+  v.isLiked     = has(v.likes);
+  v.isSaved     = has(v.saves);
+  v.isReposted  = has(v.reposts);
+  v.isFavorited = has(v.favorites);
   return v;
 };
 
@@ -48,10 +72,28 @@ exports.getUploadSignature = async (req, res) => {
     const timestamp = Math.round(Date.now() / 1000);
     const folder    = `truevision/videos/${req.user.id}`;
 
-    // Sign only folder + timestamp.
-    // NO synchronous transformation — Cloudinary rejects it on large videos.
-    // Quality variants are served lazily via URL-based transforms (buildQualityUrls).
-    const paramsToSign = { folder, timestamp };
+    // ── Eager transcoding at upload time ──────────────────────────────────
+    //
+    // ROOT-CAUSE FIX for the "newest video hangs on the loading spinner"
+    // bug. Previously we signed only { folder, timestamp } and left
+    // Cloudinary to transcode video variants on the FIRST client request.
+    // For the newest upload, that first request hits an un-derived asset
+    // and Cloudinary starts transcoding synchronously — 30 s to several
+    // minutes for typical iPhone HEVC .mov sources. Mobile players time
+    // out. Older videos work because their transcodes are already cached
+    // at Cloudinary's edge.
+    //
+    // The eager parameter tells Cloudinary to kick off the 720p + 360p
+    // transcodes IMMEDIATELY as part of the upload. With eager_async=true
+    // the upload response is still fast; by the time our /videos/create
+    // controller finishes moderating + saving the DB record (10-20 s),
+    // Cloudinary is almost always done. The FIRST playback then serves
+    // the pre-derived asset — no on-demand wait.
+    const eager       = buildEagerString();
+    const eagerAsync  = 'true';
+
+    // Signed params MUST match the FormData the client will send.
+    const paramsToSign = { eager, eager_async: eagerAsync, folder, timestamp };
     const signature    = cloudinary.utils.api_sign_request(
       paramsToSign,
       process.env.CLOUDINARY_SECRET_KEY,
@@ -61,6 +103,8 @@ exports.getUploadSignature = async (req, res) => {
       signature,
       timestamp,
       folder,
+      eager,
+      eager_async: eagerAsync,
       api_key:    process.env.CLOUDINARY_API_KEY,
       cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
     });
@@ -118,6 +162,12 @@ exports.createVideo = async (req, res) => {
     const {
       // Cloudinary result fields
       publicId, secureUrl, duration = 0, bytes = 0, format = '', width = 0, height = 0,
+      // Eager-derived URLs from Cloudinary's upload response — each entry is
+      // { transformation, secure_url, width, height, status }. Saved as-is
+      // into the `qualities` map when present so playback URLs are the exact
+      // strings Cloudinary generated (guaranteed to hit the pre-derived
+      // asset). Any missing rung falls back to buildQualityUrls below.
+      eagerResults  = [],
       // Metadata
       title, description = '', song = '', tags = '',
       category = 'other', visibility = 'public',
@@ -173,7 +223,39 @@ exports.createVideo = async (req, res) => {
     }
 
     const thumbnailUrl = buildThumbnailUrl(publicId);
-    const qualities    = buildQualityUrls(publicId);
+
+    // ── qualities map: prefer Cloudinary's eager URLs when present ──────────
+    //
+    // Cloudinary's upload response returns each derived asset's exact
+    // secure_url in the eager array. Using those verbatim guarantees the
+    // player fetches the pre-transcoded file (no on-demand transcode wait
+    // for the newest video — the root cause of the historical "stuck on
+    // loading spinner" bug).
+    //
+    // buildQualityUrls() is used as the fallback for rungs that were not
+    // in the eager set (144p / 240p / 480p) — those transcode lazily on
+    // first request, which is fine because the player only touches them
+    // when 720p / 360p are unavailable.
+    const qualities = buildQualityUrls(publicId);
+
+    if (Array.isArray(eagerResults)) {
+      for (const e of eagerResults) {
+        if (!e?.secure_url) continue;
+        const h = Number(e.height) || 0;
+        // Map by pixel height to the quality-ladder label. The exact rung
+        // labels have to match what the frontend expects, so keep the map
+        // 1-to-1 with QUALITY_LADDER in middleware/upload.js.
+        const label =
+          h >= 720 ? '720p' :
+          h >= 480 ? '480p' :
+          h >= 360 ? '360p' :
+          h >= 240 ? '240p' :
+          h >= 144 ? '144p' : null;
+        if (label) qualities[label] = e.secure_url;
+      }
+    }
+
+    console.log(`[createVideo] publicId=${publicId} eagerRungs=${eagerResults.map(e => e?.height).filter(Boolean).join(',') || 'none'} bytes=${bytes} fmt=${format} dur=${duration}s`);
 
     // Safely coerce — body values can be boolean or string "true"/"false"
     const toBool = (v, def = true) => v === undefined ? def : v === 'false' ? false : !!v;
@@ -285,7 +367,8 @@ exports.getFeed = async (req, res) => {
     if (req.user?.id) match.notInterested = { $nin: [req.user.id] };
 
     if (sort === 'random') {
-      // MongoDB $sample for a random selection
+      // MongoDB $sample for a random selection — deliberately NOT cached
+      // (each hit should return a different sample).
       const pipeline = [
         { $match: match },
         { $sample: { size: limit } },
@@ -308,15 +391,25 @@ exports.getFeed = async (req, res) => {
     const sortQuery = sortMap[sort] || sortMap.new;
     const skip      = (page - 1) * limit;
 
-    const [videos, total] = await Promise.all([
-      Video.find(match)
-        .sort(sortQuery)
-        .skip(skip)
-        .limit(limit)
-        .populate('userId', 'username fullName profileImage')
-        .lean(),
-      Video.countDocuments(match),
-    ]);
+    // ── Cache-aside: same {sort, category, page, limit, viewer} → same result
+    // for 30 s. The `viewerId` component is critical: the notInterested filter
+    // is per-user, so sharing across viewers would leak filter state.
+    const cacheKey = kFeed({
+      sort, category, page, limit,
+      viewerId: req.user?.id?.toString(),
+    });
+
+    const [videos, total] = await cache.withCache(cacheKey, TTL.feed, async () => {
+      return Promise.all([
+        Video.find(match)
+          .sort(sortQuery)
+          .skip(skip)
+          .limit(limit)
+          .populate('userId', 'username fullName profileImage')
+          .lean(),
+        Video.countDocuments(match),
+      ]);
+    });
 
     const enriched = await markReposts(videos, req.user?.id);
 
@@ -351,13 +444,22 @@ async function markReposts(videos, viewerId) {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getVideoById = async (req, res) => {
   try {
-    const video = await Video.findById(req.params.id)
-      .populate('userId',       'username fullName profileImage')
-      .populate('pinnedComment');
+    // Cache-aside — video docs rarely change vs. how often the player fetches
+    // them. Invalidated on toggleLike/toggleSave/toggleRepost/updateVideo below.
+    // withUserFlags still runs live per-request so isLiked/isSaved stay correct
+    // for the *current* viewer even when the doc is served from cache.
+    const videoDoc = await cache.withCache(
+      kVideo(req.params.id),
+      TTL.videoById,
+      async () => Video.findById(req.params.id)
+        .populate('userId',       'username fullName profileImage')
+        .populate('pinnedComment')
+        .lean(),
+    );
 
-    if (!video || video.status === 'deleted') return fail(res, 'Video not found', 404);
+    if (!videoDoc || videoDoc.status === 'deleted') return fail(res, 'Video not found', 404);
 
-    const data = req.user ? withUserFlags(video, req.user.id) : video.toObject();
+    const data = req.user ? withUserFlags(videoDoc, req.user.id) : videoDoc;
     return ok(res, { video: data });
   } catch (err) {
     console.error('getVideoById error:', err);
@@ -559,18 +661,22 @@ exports.searchHashtags = async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit) || 20, 50);
     if (q.length < 1) return ok(res, { hashtags: [] });
 
-    const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-
-    const rows = await Video.aggregate([
-      { $match: { status: 'active', visibility: 'public', tags: { $exists: true, $ne: [] } } },
-      { $unwind: '$tags' },
-      { $project: { tag: { $toLower: '$tags' } } },
-      { $match: { tag: re } },
-      { $group: { _id: '$tag', videosCount: { $sum: 1 } } },
-      { $sort: { videosCount: -1, _id: 1 } },
-      { $limit: limit },
-      { $project: { _id: 0, tag: '$_id', videosCount: 1 } },
-    ]);
+    // Cache-aside — same query text returns the same aggregation for 5 min.
+    // Not invalidated on video upload (a slight staleness on very-fresh
+    // videos is acceptable for a search suggestion list).
+    const rows = await cache.withCache(kHashtag(q, limit), TTL.hashtag, async () => {
+      const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      return Video.aggregate([
+        { $match: { status: 'active', visibility: 'public', tags: { $exists: true, $ne: [] } } },
+        { $unwind: '$tags' },
+        { $project: { tag: { $toLower: '$tags' } } },
+        { $match: { tag: re } },
+        { $group: { _id: '$tag', videosCount: { $sum: 1 } } },
+        { $sort: { videosCount: -1, _id: 1 } },
+        { $limit: limit },
+        { $project: { _id: 0, tag: '$_id', videosCount: 1 } },
+      ]);
+    });
 
     return ok(res, { hashtags: rows });
   } catch (err) {
@@ -904,11 +1010,20 @@ exports.downloadVideo = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.shareVideo = async (req, res) => {
   try {
-    const video = await Video.findByIdAndUpdate(
-      req.params.id,
-      { $inc: { sharesCount: 1 } },
-      { new: true },
-    );
+    // Try to buffer the counter in Redis first — if that succeeds, we skip
+    // the Mongo $inc for this call. The flusher in services/counterBuffer.js
+    // batches accumulated deltas into a single bulkWrite every 30 s.
+    const counterBuffer = require('../services/counterBuffer');
+    const buffered = await counterBuffer.bumpVideo(req.params.id, 'sharesCount', 1);
+
+    // Either buffered → just read the current doc; or fallback → $inc live.
+    const video = buffered
+      ? await Video.findById(req.params.id)
+      : await Video.findByIdAndUpdate(
+          req.params.id,
+          { $inc: { sharesCount: 1 } },
+          { new: true },
+        );
     if (!video || video.status === 'deleted') return fail(res, 'Video not found', 404);
 
     // Mirror to SharedVideo for the "My Activity → Shared Videos" list.

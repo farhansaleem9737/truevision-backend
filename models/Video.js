@@ -251,4 +251,23 @@ videoSchema.methods.isRepostedBy   = function (uid) { return this.reposts.some(i
 videoSchema.methods.isFavoritedBy  = function (uid) { return this.favorites.some(id => id.equals(uid)); };
 videoSchema.methods.hasViewedBy    = function (uid) { return this.views.some(v => v.userId && v.userId.equals(uid)); };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CACHE INVALIDATION HOOK
+// Fires after every save() — that covers toggleLike / toggleSave / toggleRepost
+// / toggleFavorite / recordView / updateVideo / createVideo / deleteVideo (soft)
+// without having to tag each controller by hand. Also runs on findOneAndUpdate.
+// Lazy require avoids a circular dep with services/cache → config/redis.
+// ─────────────────────────────────────────────────────────────────────────────
+function invalidate(doc) {
+  if (!doc) return;
+  try {
+    const cache = require('../services/cache');
+    cache.del(`video:byId:${doc._id}`).catch(() => {});
+    cache.delByPrefix('video:feed:*').catch(() => {});
+  } catch (_) { /* cache is optional */ }
+}
+videoSchema.post('save',              function (doc) { invalidate(doc); });
+videoSchema.post('findOneAndUpdate',  function (doc) { invalidate(doc); });
+videoSchema.post('findOneAndDelete',  function (doc) { invalidate(doc); });
+
 module.exports = mongoose.model('Video', videoSchema);

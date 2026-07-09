@@ -48,19 +48,61 @@ const uploadToCloudinary = (buffer, extraOptions = {}) => {
   });
 };
 
+// ── Build a single transformation option object for a given rung. ────────────
+// Exported so the eager-transformation string signed at upload time can be
+// built from the SAME shape — Cloudinary caches derived files by
+// transformation string, so any drift between eager and URL-generated
+// transforms would cause a costly re-transcode on first playback (which is
+// exactly the bug we're preventing).
+const qualityTransform = ({ width, height }) => ({
+  width, height,
+  crop:        'limit',
+  quality:     'auto',
+  video_codec: 'auto',
+  format:      'mp4',
+});
+
 // ── Build quality variant URLs from a Cloudinary public_id ───────────────────
-// Cloudinary generates these lazily on first request, then caches them.
-// No need to wait for eager transforms at upload time.
+// URLs match the eager-transform strings signed at upload time. On the first
+// playback request Cloudinary serves the derived file that was pre-generated
+// (or fast-tracks it if the async eager job hasn't quite finished).
 const buildQualityUrls = (publicId) => {
   const urls = {};
-  QUALITY_LADDER.forEach(({ label, width, height }) => {
-    urls[label] = cloudinary.url(publicId, {
+  QUALITY_LADDER.forEach((rung) => {
+    urls[rung.label] = cloudinary.url(publicId, {
       resource_type:  'video',
       secure:         true,
-      transformation: [{ width, height, crop: 'limit', format: 'mp4', video_codec: 'auto', quality: 'auto' }],
+      transformation: [qualityTransform(rung)],
     });
   });
   return urls;
+};
+
+// ── Build the eager transformation string to sign at upload time ────────────
+//
+// Cloudinary starts transcoding as part of the upload response. With
+// `eager_async: true` the upload returns quickly and the transform runs in
+// the background; the response STILL contains the eager URL, and by the
+// time our /videos/create controller finishes moderating + saving the DB
+// record, Cloudinary is typically done.
+//
+// The result: the FIRST playback request from a mobile player is served by
+// the pre-existing derived asset — no on-demand transcode wait. This is the
+// exact WhatsApp / Reels pattern for direct-upload flows.
+//
+// Which rungs to eager? We pick 720p + 360p:
+//   720p → the primary URL the player uses on Wi-Fi/4G
+//   360p → the fallback for data-saver + our slow-network resilience path
+// Larger rungs are still generated lazily on demand — they don't matter for
+// first-play, so paying the eager cost for them wastes uploader wall-time.
+const EAGER_RUNGS = ['720p', '360p'];
+
+const buildEagerString = () => {
+  const transforms = EAGER_RUNGS
+    .map((label) => QUALITY_LADDER.find((r) => r.label === label))
+    .filter(Boolean)
+    .map((rung) => cloudinary.utils.generate_transformation_string(qualityTransform(rung)));
+  return transforms.join('|');
 };
 
 // ── Build a thumbnail URL from a public_id (frame at 2 seconds) ──────────────
@@ -82,5 +124,7 @@ module.exports = {
   deleteFromCloudinary,
   buildQualityUrls,
   buildThumbnailUrl,
+  buildEagerString,
   QUALITY_LADDER,
+  EAGER_RUNGS,
 };

@@ -1,210 +1,205 @@
 // Backend/socket.js
 //
-// Socket.IO server — handles real-time chat events.
-// Events emitted TO client:   newMessage, messageSeen, userOnline, userOffline, typing
-// Events received FROM client: joinChat, sendMessage, markSeen, typing, stopTyping
+// Socket.IO server — real-time chat events + presence + typing indicators.
+//
+// The `sendMessage` path here delegates to ChatController's private helpers
+// (createMessageDoc, updateChatAfterSend, fanOutNewMessage) so REST and
+// socket writes stay in lockstep. Group chats work correctly — every
+// non-sender member is marked unread via an atomic $inc, not the old
+// "find(!sender)" that only picked the first non-sender.
+//
+// Events emitted to client:
+//   newMessage / messageEdited / messageDeleted / messageReaction /
+//   messagePinned / messageSeen / messageDelivered / messagesDelivered /
+//   chatUpdated / typing / stopTyping / userOnline / userOffline
+//
+// Events received from client:
+//   joinChat / leaveChat / sendMessage / markSeen / typing / stopTyping
 
 const { Server } = require('socket.io');
 const jwt        = require('jsonwebtoken');
 const User       = require('./models/User');
 const Chat       = require('./models/Chat');
 const Message    = require('./models/Message');
+const presence   = require('./services/presenceStore');
 
-// userId → Set<socketId>  (a user can have multiple devices connected)
-const onlineUsers = new Map();
+// Legacy alias for old callers.
+const onlineUsers = {
+  has: (uid) => presence.isOnline(uid),
+  get: (uid) => presence.socketsFor(uid),
+};
 
 let io = null;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** Get all socket IDs for a user. */
-const socketsFor = (userId) => onlineUsers.get(userId) || new Set();
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Emit to every socket a user has open. */
-const emitToUser = (userId, event, data) => {
-  socketsFor(userId).forEach((sid) => io.to(sid).emit(event, data));
+const emitToUser = async (userId, event, data) => {
+  if (!io) return;
+  const sockets = await presence.socketsFor(userId);
+  sockets.forEach((sid) => io.to(sid).emit(event, data));
 };
 
-/** Return the io instance (for use elsewhere if needed). */
 const getIO = () => io;
+const presenceIsOnline = (uid) => presence.isOnline(uid);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Init
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Init ────────────────────────────────────────────────────────────────────
 
 const initSocket = (httpServer) => {
   io = new Server(httpServer, {
-    cors: {
-      origin: '*',           // React Native doesn't send origin — allow all in dev
-      methods: ['GET', 'POST'],
-    },
+    cors: { origin: '*', methods: ['GET', 'POST'] },
     pingInterval: 25000,
     pingTimeout:  60000,
+    maxHttpBufferSize: 1e6, // 1 MB — anything bigger should upload via Cloudinary.
   });
 
-  // ── Auth middleware — verify JWT before allowing connection ─────────────
+  // ── Auth middleware — verify JWT before allowing connection ───────────
   io.use(async (socket, next) => {
     try {
       const token = socket.handshake.auth?.token;
       if (!token) return next(new Error('Authentication required'));
 
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      const user    = await User.findById(decoded.userId).select('fullName username profileImage').lean();
+      const user    = await User.findById(decoded.userId)
+        .select('fullName username profileImage isVerified')
+        .lean();
       if (!user) return next(new Error('User not found'));
 
       socket.userId   = user._id.toString();
-      socket.userData  = user;
+      socket.userData = user;
       next();
     } catch (err) {
       next(new Error('Invalid token'));
     }
   });
 
-  // ── Connection handler ─────────────────────────────────────────────────
-  io.on('connection', (socket) => {
+  // ── Connection handler ────────────────────────────────────────────────
+  io.on('connection', async (socket) => {
     const uid = socket.userId;
     console.log(`⚡ Socket connected: ${socket.userData.username} (${uid})`);
 
-    const wasOffline = !onlineUsers.has(uid);
-    if (wasOffline) onlineUsers.set(uid, new Set());
-    onlineUsers.get(uid).add(socket.id);
+    const wasOffline = presence.wasOffline(uid);
+    await presence.addSocket(uid, socket.id);
+
+    // Personal room — a user's own userId is a room they can be paged on.
+    socket.join(`user:${uid}`);
 
     if (wasOffline) {
       User.findByIdAndUpdate(uid, { isOnline: true }).exec().catch(() => {});
       broadcastOnlineStatus(uid, true);
       flushPendingDeliveries(uid).catch((err) =>
-        console.error('flushPendingDeliveries error:', err)
+        console.error('flushPendingDeliveries error:', err),
       );
     }
 
-    // ── Join a chat room ───────────────────────────────────────────────
-    socket.on('joinChat', (chatId) => {
-      socket.join(`chat:${chatId}`);
-    });
+    // ── Chat rooms ──────────────────────────────────────────────────────
+    socket.on('joinChat',  (chatId) => chatId && socket.join(`chat:${chatId}`));
+    socket.on('leaveChat', (chatId) => chatId && socket.leave(`chat:${chatId}`));
 
-    socket.on('leaveChat', (chatId) => {
-      socket.leave(`chat:${chatId}`);
-    });
-
-    // ── Send message (real-time path) ──────────────────────────────────
+    // ── Send message (real-time path) ───────────────────────────────────
+    // Delegates to the same helpers REST uses so both paths behave identically.
     socket.on('sendMessage', async (data, ack) => {
       try {
-        const { chatId, text, type = 'text', videoId, imageUrl } = data;
+        const controller = require('./controllers/ChatController');
+        const { chatId } = data || {};
         if (!chatId) return ack?.({ success: false, message: 'chatId required' });
 
-        // Verify membership
+        // Idempotency short-circuit — if this key was seen already, just
+        // return the winner so the sender's optimistic bubble reconciles.
+        if (data.clientMsgId) {
+          const existing = await Message.findOne({ senderId: uid, clientMsgId: data.clientMsgId });
+          if (existing) {
+            const populated = await controller._buildMessagePayload(existing._id);
+            return ack?.({ success: true, message: populated, deduped: true });
+          }
+        }
+
         const chat = await Chat.findById(chatId);
-        if (!chat || !chat.members.some(m => m.toString() === uid)) {
+        if (!chat) return ack?.({ success: false, message: 'Chat not found' });
+        if (!chat.members.some(m => m.toString() === uid)) {
           return ack?.({ success: false, message: 'Not a member' });
         }
 
-        // Decide initial status: if recipient has a live socket, mark as delivered immediately
-        const otherId = chat.members.find(m => m.toString() !== uid).toString();
-        const recipientOnline = onlineUsers.has(otherId);
-        const now = new Date();
+        const message = await controller._createMessageDoc({ chat, senderId: uid, body: data });
+        await controller._updateChatAfterSend({ chat, message, senderId: uid });
+        await controller._fanOutNewMessage({ chat, message, senderId: uid });
 
-        const message = await Message.create({
-          chatId,
-          senderId: uid,
-          text:     text?.trim() || '',
-          type,
-          videoId:  type === 'video' ? videoId : null,
-          imageUrl: type === 'image' ? imageUrl : null,
-          status:   recipientOnline ? 'delivered' : 'sent',
-          deliveredAt: recipientOnline ? now : null,
-        });
-
-        // Update chat metadata
-        let preview = text?.trim() || '';
-        if (type === 'video') preview = '🎬 Shared a video';
-        if (type === 'image') preview = '📷 Sent an image';
-
-        const currentUnread = chat.unreadCount?.get?.(otherId) || 0;
-
-        chat.lastMessage = { text: preview, senderId: uid, type, createdAt: message.createdAt };
-        chat.unreadCount.set(otherId, currentUnread + 1);
-        await chat.save();
-
-        // Populate for emission
-        const populated = await Message.findById(message._id)
-          .populate('senderId', 'fullName username profileImage')
-          .populate('videoId',  'title thumbnailUrl videoUrl userId duration')
-          .lean();
-
-        // Emit to everyone in the chat room (includes sender for confirmation)
-        io.to(`chat:${chatId}`).emit('newMessage', populated);
-
-        // If recipient was online, tell sender it's already delivered
-        if (recipientOnline) {
+        // Also let sender know about delivered status if any recipient was online.
+        const populated = await controller._buildMessagePayload(message._id);
+        if (populated.status === 'delivered') {
           emitToUser(uid, 'messageDelivered', {
-            chatId,
-            messageId: message._id.toString(),
-            deliveredAt: now,
+            chatId, messageId: message._id.toString(), deliveredAt: message.deliveredAt,
           });
         }
 
-        // Also emit to the OTHER user's sockets (in case they're on the inbox, not in the chat room)
-        emitToUser(otherId, 'chatUpdated', {
-          chatId,
-          lastMessage: chat.lastMessage,
-          unreadCount: currentUnread + 1,
-        });
-
         ack?.({ success: true, message: populated });
       } catch (err) {
+        // Idempotent recovery on unique-index collision (race between
+        // socket send and REST send with the same clientMsgId).
+        if (err?.code === 11000 && err.keyPattern?.clientMsgId) {
+          try {
+            const controller = require('./controllers/ChatController');
+            const existing = await Message.findOne({
+              senderId: uid, clientMsgId: data?.clientMsgId,
+            });
+            if (existing) {
+              const populated = await controller._buildMessagePayload(existing._id);
+              return ack?.({ success: true, message: populated, deduped: true });
+            }
+          } catch (_) { /* fall through */ }
+        }
         console.error('sendMessage socket error:', err);
-        ack?.({ success: false, message: err.message });
+        ack?.({ success: false, message: err.message || 'Failed' });
       }
     });
 
-    // ── Mark messages as seen ──────────────────────────────────────────
+    // ── Mark seen ───────────────────────────────────────────────────────
     socket.on('markSeen', async ({ chatId }) => {
       try {
-        const chat = await Chat.findById(chatId);
+        const chat = await Chat.findById(chatId).lean();
         if (!chat) return;
+        if (!chat.members.some(m => m.toString() === uid)) return;
 
         const now = new Date();
         await Message.updateMany(
           { chatId, senderId: { $ne: uid }, status: { $ne: 'seen' } },
           { $set: { status: 'seen', seen: true, seenAt: now } },
         );
+        await Chat.updateOne({ _id: chatId }, { $set: { [`unreadCount.${uid}`]: 0 } });
 
-        chat.unreadCount.set(uid, 0);
-        await chat.save();
-
-        // Notify the other user their messages were seen
-        const otherUserId = chat.members.find(m => m.toString() !== uid)?.toString();
-        if (otherUserId) {
-          emitToUser(otherUserId, 'messageSeen', { chatId, seenBy: uid, seenAt: now });
-        }
+        // Notify every other member their messages were seen.
+        chat.members
+          .map(m => m.toString())
+          .filter(m => m !== uid)
+          .forEach(otherId => emitToUser(otherId, 'messageSeen', { chatId, seenBy: uid, seenAt: now }));
       } catch (err) {
         console.error('markSeen error:', err);
       }
     });
 
-    // ── Typing indicators ──────────────────────────────────────────────
+    // ── Typing ──────────────────────────────────────────────────────────
     socket.on('typing', ({ chatId }) => {
+      if (!chatId) return;
+      presence.setTyping(chatId, uid).catch(() => {});
       socket.to(`chat:${chatId}`).emit('typing', { chatId, userId: uid, username: socket.userData.username });
     });
 
     socket.on('stopTyping', ({ chatId }) => {
+      if (!chatId) return;
+      presence.clearTyping(chatId, uid).catch(() => {});
       socket.to(`chat:${chatId}`).emit('stopTyping', { chatId, userId: uid });
     });
 
-    // ── Disconnect ─────────────────────────────────────────────────────
-    socket.on('disconnect', () => {
-      console.log(`🔌 Socket disconnected: ${socket.userData.username}`);
-      const sockets = onlineUsers.get(uid);
-      if (sockets) {
-        sockets.delete(socket.id);
-        if (sockets.size === 0) {
-          onlineUsers.delete(uid);
-          const lastSeen = new Date();
-          User.findByIdAndUpdate(uid, { isOnline: false, lastSeen }).exec().catch(() => {});
-          broadcastOnlineStatus(uid, false, lastSeen);
-        }
+    // ── Disconnect ──────────────────────────────────────────────────────
+    socket.on('disconnect', async () => {
+      console.log(`🔌 Socket disconnected: ${socket.userData?.username || uid}`);
+      await presence.removeSocket(uid, socket.id);
+
+      // Last socket for this user → mark offline + broadcast.
+      if (!presence.isOnline(uid)) {
+        const lastSeen = new Date();
+        User.findByIdAndUpdate(uid, { isOnline: false, lastSeen }).exec().catch(() => {});
+        broadcastOnlineStatus(uid, false, lastSeen);
       }
     });
   });
@@ -212,59 +207,56 @@ const initSocket = (httpServer) => {
   return io;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Broadcast online/offline to chat partners
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Presence broadcast ─────────────────────────────────────────────────────
+// Batched per-user rather than per-chat so a user with 500 partners doesn't
+// fan out 500 individual queries. One aggregation + one Set = one emit per
+// partner instead of one per chat.
 async function broadcastOnlineStatus(userId, isOnline, lastSeen = null) {
   try {
     const chats = await Chat.find({ members: userId }).select('members').lean();
-    const partnerIds = new Set();
-    chats.forEach((c) => {
-      c.members.forEach((m) => {
-        const mid = m.toString();
-        if (mid !== userId) partnerIds.add(mid);
-      });
-    });
+    const partners = new Set();
+    chats.forEach((c) => c.members.forEach((m) => {
+      const mid = m.toString();
+      if (mid !== userId) partners.add(mid);
+    }));
     const payload = isOnline ? { userId } : { userId, lastSeen };
     const event   = isOnline ? 'userOnline' : 'userOffline';
-    partnerIds.forEach((pid) => emitToUser(pid, event, payload));
+    partners.forEach((pid) => emitToUser(pid, event, payload));
   } catch (err) {
     console.error('broadcastOnlineStatus error:', err);
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// When a user (re)connects, flip any messages sent to them while offline
-// from 'sent' → 'delivered' and notify each sender in real time.
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Pending-delivery flush ─────────────────────────────────────────────────
+// On (re)connect, mark every 'sent' message that landed in one of the user's
+// chats as 'delivered' and tell each sender in real-time.
 async function flushPendingDeliveries(userId) {
-  // Messages whose recipient is this user and that are still 'sent'
+  // Restrict the initial scan to chats the user actually belongs to.
+  const myChats = await Chat.find({ members: userId }).select('_id').lean();
+  const myChatIds = myChats.map(c => c._id);
+  if (!myChatIds.length) return;
+
   const pending = await Message.find({
-    status: 'sent',
-    senderId: { $ne: userId },
-  })
-    .populate({ path: 'chatId', select: 'members', match: { members: userId } })
-    .lean();
+    chatId:  { $in: myChatIds },
+    senderId:{ $ne: userId },
+    status:  'sent',
+  }).select('_id chatId senderId').lean();
 
-  const relevant = pending.filter((m) => m.chatId); // populate filter match → null if not member
-  if (!relevant.length) return;
+  if (!pending.length) return;
 
-  const ids = relevant.map((m) => m._id);
   const now = new Date();
+  const ids = pending.map(m => m._id);
   await Message.updateMany(
     { _id: { $in: ids } },
-    { $set: { status: 'delivered', deliveredAt: now } }
+    { $set: { status: 'delivered', deliveredAt: now } },
   );
 
-  // Group by sender and by chat for the outgoing notification
-  const bySender = new Map(); // senderId → [{ chatId, messageId }]
-  relevant.forEach((m) => {
+  // Group by sender for batched delivery notifications.
+  const bySender = new Map();
+  pending.forEach((m) => {
     const sid = m.senderId.toString();
     if (!bySender.has(sid)) bySender.set(sid, []);
-    bySender.get(sid).push({
-      chatId: m.chatId._id.toString(),
-      messageId: m._id.toString(),
-    });
+    bySender.get(sid).push({ chatId: m.chatId.toString(), messageId: m._id.toString() });
   });
 
   bySender.forEach((items, senderId) => {
@@ -272,4 +264,10 @@ async function flushPendingDeliveries(userId) {
   });
 }
 
-module.exports = { initSocket, getIO, onlineUsers };
+module.exports = {
+  initSocket,
+  getIO,
+  emitToUser,
+  presenceIsOnline,
+  onlineUsers, // legacy
+};

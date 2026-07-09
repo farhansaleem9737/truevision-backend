@@ -1,35 +1,143 @@
 // Backend/controllers/ChatController.js
-const Chat    = require('../models/Chat');
-const Message = require('../models/Message');
-const User    = require('../models/User');
-const { onlineUsers } = require('../socket');
+//
+// All REST endpoints for chats + messages. The socket path in socket.js
+// shares helpers with this file where it makes sense (previewFor,
+// buildMessagePayload) — we don't want two forks of the same logic.
+
+const mongoose = require('mongoose');
+const Chat     = require('../models/Chat');
+const Message  = require('../models/Message');
+const User     = require('../models/User');
+const push     = require('../services/pushService');
+
+let socketModule = null;
+const getSocketModule = () => {
+  if (!socketModule) socketModule = require('../socket');
+  return socketModule;
+};
 
 const ok   = (res, data, code = 200) => res.status(code).json({ success: true, ...data });
 const fail = (res, msg,  code = 400) => res.status(code).json({ success: false, message: msg });
 
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+/** Everyone in a chat except the sender. Group-safe (returns an array). */
+const otherMembers = (chat, senderId) =>
+  chat.members
+    .map(m => m.toString())
+    .filter(m => m !== senderId.toString());
+
+/** Build the lastMessage snapshot stored on the Chat doc. */
+const snapshotFor = (msg) => ({
+  text:      push.previewFor(msg),
+  senderId:  msg.senderId,
+  type:      msg.type,
+  createdAt: msg.createdAt,
+});
+
+/** Shape a message payload for emission to the client. */
+const buildMessagePayload = async (messageId) => {
+  return Message.findById(messageId)
+    .populate('senderId',        'fullName username profileImage isVerified')
+    .populate('videoId',         'title thumbnailUrl videoUrl userId duration')
+    .populate('replyTo.senderId','fullName username')
+    .populate('reactions.userId','username')
+    .lean();
+};
+
+/** Emit a message + inbox update to every member of a chat + fire push
+ *  notifications to any who are offline. Called after every mutating action
+ *  (send, edit, react, pin, star for chat-wide events).
+ */
+const fanOutNewMessage = async ({ chat, message, senderId }) => {
+  const S = getSocketModule();
+  const io = S.getIO();
+  if (!io) return;
+
+  const populated = await buildMessagePayload(message._id);
+
+  // Anyone joined to the chat room gets the message live.
+  io.to(`chat:${chat._id}`).emit('newMessage', populated);
+
+  // Everyone in the chat also gets an inbox nudge (in case they're on
+  // the list screen, not inside the conversation).
+  for (const otherId of otherMembers(chat, senderId)) {
+    const unread = chat.unreadCount?.get?.(otherId) || 0;
+    S.emitToUser(otherId, 'chatUpdated', {
+      chatId:      chat._id,
+      lastMessage: chat.lastMessage,
+      unreadCount: unread,
+    });
+  }
+
+  // Push notifications for offline recipients that haven't muted this chat.
+  const mutedSet = new Set((chat.mutedBy || []).map(u => u.toString()));
+  const recipients = otherMembers(chat, senderId)
+    .filter(uid => !mutedSet.has(uid))
+    .filter(uid => !S.presenceIsOnline(uid));
+
+  if (recipients.length && push.available()) {
+    const users = await User.find({ _id: { $in: recipients } })
+      .select('expoPushTokens fcmTokens')
+      .lean();
+    const sender = populated.senderId || {};
+    const title = chat.type === 'group'
+      ? `${sender.username || 'Someone'} • ${chat.groupName || 'Group'}`
+      : sender.username || 'New message';
+    await Promise.all(users.map(u => push.sendChatNotification(u, {
+      title,
+      body:      push.previewFor(message),
+      chatId:    chat._id.toString(),
+      senderId:  senderId.toString(),
+      messageId: message._id.toString(),
+      type:      message.type,
+    })));
+  }
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/chats — list all chats for the logged-in user
+// GET /api/chats
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getMyChats = async (req, res) => {
   try {
     const userId = req.user.id;
+    const includeArchived = req.query.archived === '1';
 
-    const chats = await Chat.find({ members: userId })
-      .populate('members', 'fullName username profileImage isOnline lastSeen')
+    const query = { members: userId };
+    if (!includeArchived) query.archivedBy = { $ne: userId };
+    else                  query.archivedBy = userId;
+
+    const chats = await Chat.find(query)
+      .populate('members', 'fullName username profileImage isOnline lastSeen isVerified')
       .populate('lastMessage.senderId', 'username')
       .sort({ updatedAt: -1 })
       .lean();
 
-    // Shape each chat for the client
+    // Shape each chat for the client — includes user-specific flags.
     const shaped = chats.map((chat) => {
       const other = chat.members.find(m => m._id.toString() !== userId);
+      const unreadCount = chat.unreadCount?.[userId] || 0;
       return {
         _id:         chat._id,
+        type:        chat.type,
         otherUser:   other || { _id: null, fullName: 'Deleted User', username: 'deleted', profileImage: null },
+        groupName:   chat.groupName,
+        groupImage:  chat.groupImage,
+        members:     chat.type === 'group' ? chat.members : undefined,
         lastMessage: chat.lastMessage,
-        unreadCount: chat.unreadCount?.get?.(userId) || chat.unreadCount?.[userId] || 0,
-        updatedAt:   chat.updatedAt,
+        unreadCount,
+        // Per-user derived state.
+        isPinned:   (chat.pinnedBy   || []).some(u => u.toString() === userId),
+        isMuted:    (chat.mutedBy    || []).some(u => u.toString() === userId),
+        isArchived: (chat.archivedBy || []).some(u => u.toString() === userId),
+        updatedAt:  chat.updatedAt,
       };
+    });
+
+    // Pinned chats bubble to the top, then chronological.
+    shaped.sort((a, b) => {
+      if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+      return new Date(b.updatedAt) - new Date(a.updatedAt);
     });
 
     return ok(res, { chats: shaped });
@@ -40,32 +148,30 @@ exports.getMyChats = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/chats — create or get existing 1-on-1 chat
-// Body: { userId }  (the other user's ID)
+// POST /api/chats — create/get 1-on-1
 // ─────────────────────────────────────────────────────────────────────────────
 exports.createOrGetChat = async (req, res) => {
   try {
     const myId    = req.user.id;
     const otherId = req.body.userId;
 
-    if (!otherId) return fail(res, 'userId is required');
+    if (!otherId)         return fail(res, 'userId is required');
     if (myId === otherId) return fail(res, 'Cannot create a chat with yourself');
+    if (!mongoose.Types.ObjectId.isValid(otherId)) return fail(res, 'Invalid userId');
 
-    // Check other user exists
-    const otherUser = await User.findById(otherId).select('fullName username profileImage isOnline lastSeen');
+    const otherUser = await User.findById(otherId)
+      .select('fullName username profileImage isOnline lastSeen isVerified');
     if (!otherUser) return fail(res, 'User not found', 404);
 
-    // Find existing chat between these two users
     let chat = await Chat.findOne({
+      type: 'single',
       members: { $all: [myId, otherId], $size: 2 },
-    }).populate('members', 'fullName username profileImage isOnline lastSeen');
+    }).populate('members', 'fullName username profileImage isOnline lastSeen isVerified');
 
     if (!chat) {
-      // Create new 1-on-1 chat — explicitly typed so legacy queries that
-      // ignore `type` still treat existing chats as 'single'.
       chat = await Chat.create({ type: 'single', members: [myId, otherId] });
       chat = await Chat.findById(chat._id)
-        .populate('members', 'fullName username profileImage isOnline lastSeen');
+        .populate('members', 'fullName username profileImage isOnline lastSeen isVerified');
     }
 
     const other = chat.members.find(m => m._id.toString() !== myId);
@@ -73,6 +179,7 @@ exports.createOrGetChat = async (req, res) => {
     return ok(res, {
       chat: {
         _id:         chat._id,
+        type:        chat.type,
         otherUser:   other,
         lastMessage: chat.lastMessage,
         unreadCount: 0,
@@ -86,60 +193,38 @@ exports.createOrGetChat = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/chats/group — create a new group chat
-// Body: { memberIds: [userId, ...], groupName, groupImage? }
-// The current user is always added to members + recorded as createdBy.
+// POST /api/chats/group
 // ─────────────────────────────────────────────────────────────────────────────
 exports.createGroup = async (req, res) => {
   try {
     const myId = req.user.id;
     const { memberIds = [], groupName, groupImage = '' } = req.body || {};
 
-    const trimmedName = (groupName || '').trim();
-    if (!trimmedName)            return fail(res, 'Group name is required');
-    if (trimmedName.length > 80) return fail(res, 'Group name is too long (max 80)');
-
+    const trimmed = (groupName || '').trim();
+    if (!trimmed)            return fail(res, 'Group name is required');
+    if (trimmed.length > 80) return fail(res, 'Group name is too long (max 80)');
     if (!Array.isArray(memberIds) || memberIds.length === 0) {
       return fail(res, 'At least one other member is required');
     }
 
-    // Dedupe + ensure creator is in members. Drop self if it appears in input.
-    const others  = [...new Set(memberIds.map(String))].filter((id) => id && id !== myId);
-    if (others.length === 0) return fail(res, 'Please add at least one other member');
+    const others = [...new Set(memberIds.map(String))].filter(id => id && id !== myId);
+    if (!others.length) return fail(res, 'Please add at least one other member');
 
-    // Validate that those users exist
     const found = await User.find({ _id: { $in: others } }).select('_id');
-    if (found.length !== others.length) {
-      return fail(res, 'One or more selected users do not exist');
-    }
-
-    const allMembers = [myId, ...others];
+    if (found.length !== others.length) return fail(res, 'One or more users do not exist');
 
     let chat = await Chat.create({
       type:      'group',
-      members:   allMembers,
-      groupName: trimmedName,
+      members:   [myId, ...others],
+      groupName: trimmed,
       groupImage,
       createdBy: myId,
     });
 
     chat = await Chat.findById(chat._id)
-      .populate('members', 'fullName username profileImage isOnline lastSeen');
+      .populate('members', 'fullName username profileImage isOnline lastSeen isVerified');
 
-    return ok(res, {
-      chat: {
-        _id:         chat._id,
-        type:        'group',
-        groupName:   chat.groupName,
-        groupImage:  chat.groupImage,
-        createdBy:   chat.createdBy,
-        members:     chat.members,
-        membersCount: chat.members.length,
-        lastMessage: chat.lastMessage,
-        unreadCount: 0,
-        updatedAt:   chat.updatedAt,
-      },
-    }, 201);
+    return ok(res, { chat }, 201);
   } catch (err) {
     console.error('createGroup error:', err);
     return fail(res, 'Failed to create group', 500);
@@ -147,7 +232,9 @@ exports.createGroup = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/chats/:chatId/messages?page=1&limit=30
+// GET /api/chats/:chatId/messages?page=1&limit=30&before=<msgId>
+//   Backwards-compatible pagination — supports either page-based or
+//   cursor-based fetching. `before=<msgId>` returns older messages.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.getMessages = async (req, res) => {
   try {
@@ -155,30 +242,46 @@ exports.getMessages = async (req, res) => {
     const { chatId } = req.params;
     const page  = Math.max(1, parseInt(req.query.page)  || 1);
     const limit = Math.min(50, parseInt(req.query.limit) || 30);
+    const before = req.query.before;
     const skip  = (page - 1) * limit;
 
-    // Verify membership
     const chat = await Chat.findById(chatId).lean();
     if (!chat) return fail(res, 'Chat not found', 404);
     if (!chat.members.some(m => m.toString() === userId)) {
       return fail(res, 'Not a member of this chat', 403);
     }
 
-    const messages = await Message.find({ chatId, deleted: false })
+    // Cleared-history horizon: only messages after clearedAt[userId].
+    const clearedAt = chat.clearedAt?.[userId];
+    const filter = {
+      chatId,
+      deleted: false,
+      deletedFor: { $ne: userId },
+      ...(clearedAt ? { createdAt: { $gt: new Date(clearedAt) } } : {}),
+    };
+
+    if (before && mongoose.Types.ObjectId.isValid(before)) {
+      const anchor = await Message.findById(before).select('createdAt').lean();
+      if (anchor) filter.createdAt = { ...(filter.createdAt || {}), $lt: anchor.createdAt };
+    }
+
+    const messages = await Message.find(filter)
       .sort({ createdAt: -1 })
-      .skip(skip)
+      .skip(before ? 0 : skip)
       .limit(limit)
-      .populate('senderId',  'fullName username profileImage')
-      .populate('videoId',   'title thumbnailUrl videoUrl userId duration')
+      .populate('senderId',         'fullName username profileImage isVerified')
+      .populate('videoId',          'title thumbnailUrl videoUrl userId duration')
+      .populate('replyTo.senderId', 'fullName username')
+      .populate('reactions.userId', 'username')
       .lean();
 
     const total = await Message.countDocuments({ chatId, deleted: false });
 
     return ok(res, {
-      messages: messages.reverse(), // oldest → newest for rendering
+      messages:   messages.reverse(),
       page,
       totalPages: Math.ceil(total / limit),
-      hasMore:    page * limit < total,
+      hasMore:    messages.length === limit,
     });
   } catch (err) {
     console.error('getMessages error:', err);
@@ -187,73 +290,148 @@ exports.getMessages = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/chats/:chatId/messages — send a message (REST fallback)
-// Body: { text, type?, videoId?, imageUrl? }
+// POST /api/chats/:chatId/messages
+//   Supports text/image/video/voice/audio/gif/document + reply + forward.
+//   Idempotent via clientMsgId — a retry with the same key returns the
+//   original message instead of creating a duplicate.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.sendMessage = async (req, res) => {
   try {
     const userId = req.user.id;
     const { chatId } = req.params;
-    const { text, type = 'text', videoId, imageUrl } = req.body;
+    const body = req.body || {};
 
-    if (type === 'text' && !text?.trim()) return fail(res, 'Message text is required');
-    if (type === 'video' && !videoId)     return fail(res, 'videoId is required for video messages');
+    // Idempotency short-circuit — if this key already exists, return it.
+    if (body.clientMsgId) {
+      const existing = await Message.findOne({ senderId: userId, clientMsgId: body.clientMsgId });
+      if (existing) {
+        const populated = await buildMessagePayload(existing._id);
+        return ok(res, { message: populated }, 200);
+      }
+    }
 
-    // Verify membership
     const chat = await Chat.findById(chatId);
     if (!chat) return fail(res, 'Chat not found', 404);
     if (!chat.members.some(m => m.toString() === userId)) {
       return fail(res, 'Not a member of this chat', 403);
     }
 
-    // Create the message — if recipient has a live socket, flag as delivered immediately
-    const otherUserId = chat.members.find(m => m.toString() !== userId).toString();
-    const recipientOnline = onlineUsers?.has?.(otherUserId) || false;
-    const deliveredAt = recipientOnline ? new Date() : null;
+    const message = await createMessageDoc({ chat, senderId: userId, body });
 
-    const message = await Message.create({
-      chatId,
-      senderId: userId,
-      text:     text?.trim() || '',
-      type,
-      videoId:  type === 'video' ? videoId : null,
-      imageUrl: type === 'image' ? imageUrl : null,
-      status:   recipientOnline ? 'delivered' : 'sent',
-      deliveredAt,
-    });
+    // Persist chat metadata + bump unread for every other member.
+    await updateChatAfterSend({ chat, message, senderId: userId });
 
-    // Determine preview text for lastMessage
-    let preview = text?.trim() || '';
-    if (type === 'video') preview = '🎬 Shared a video';
-    if (type === 'image') preview = '📷 Sent an image';
+    await fanOutNewMessage({ chat, message, senderId: userId });
 
-    // Update chat lastMessage + bump unread for the OTHER user
-    const currentUnread = chat.unreadCount?.get?.(otherUserId) || 0;
-
-    chat.lastMessage = {
-      text:      preview,
-      senderId:  userId,
-      type,
-      createdAt: message.createdAt,
-    };
-    chat.unreadCount.set(otherUserId, currentUnread + 1);
-    await chat.save();
-
-    // Populate for response
-    const populated = await Message.findById(message._id)
-      .populate('senderId', 'fullName username profileImage')
-      .populate('videoId',  'title thumbnailUrl videoUrl userId duration')
-      .lean();
-
+    const populated = await buildMessagePayload(message._id);
     return ok(res, { message: populated }, 201);
   } catch (err) {
+    // Duplicate-key surfaces from the sparse-unique index on clientMsgId.
+    // Treat as "already sent" and return the winner.
+    if (err?.code === 11000 && err.keyPattern?.clientMsgId) {
+      const existing = await Message.findOne({
+        senderId: req.user.id,
+        clientMsgId: req.body?.clientMsgId,
+      });
+      if (existing) {
+        const populated = await buildMessagePayload(existing._id);
+        return ok(res, { message: populated }, 200);
+      }
+    }
     console.error('sendMessage error:', err);
     return fail(res, 'Failed to send message', 500);
   }
 };
 
+// Shared create helper — used by REST + socket paths so the two never drift.
+async function createMessageDoc({ chat, senderId, body }) {
+  const {
+    text, type = 'text', videoId, imageUrl, imagePublicId, imageWidth, imageHeight,
+    audioUrl, audioPublicId, audioDuration, waveform,
+    gifUrl,
+    documentUrl, documentPublicId, documentName, documentSize, documentMime,
+    replyTo, forwardedFrom, clientMsgId,
+  } = body;
+
+  // Basic per-type validation.
+  if (type === 'text'  && !text?.trim())    throw new Error('Message text is required');
+  if (type === 'image' && !imageUrl)         throw new Error('imageUrl is required for image messages');
+  if (type === 'video' && !videoId)          throw new Error('videoId is required for video messages');
+  if (type === 'voice' && !audioUrl)         throw new Error('audioUrl is required for voice messages');
+  if (type === 'audio' && !audioUrl)         throw new Error('audioUrl is required for audio messages');
+  if (type === 'gif'   && !gifUrl)           throw new Error('gifUrl is required for gif messages');
+  if (type === 'document' && !documentUrl)   throw new Error('documentUrl is required for documents');
+
+  // Decide initial delivery status by asking the presence store whether
+  // any recipient is currently online.
+  const S = getSocketModule();
+  const others = otherMembers(chat, senderId);
+  const anyoneOnline = others.some(uid => S.presenceIsOnline(uid));
+  const now = new Date();
+
+  return Message.create({
+    chatId:  chat._id,
+    senderId,
+    clientMsgId: clientMsgId || null,
+    text:    text?.trim() || '',
+    type,
+    videoId:  type === 'video' ? videoId : null,
+    imageUrl: type === 'image' ? imageUrl : null,
+    imagePublicId: type === 'image' ? (imagePublicId || null) : null,
+    imageWidth:  type === 'image' ? (imageWidth  || 0) : 0,
+    imageHeight: type === 'image' ? (imageHeight || 0) : 0,
+    audioUrl:      (type === 'voice' || type === 'audio') ? audioUrl      : null,
+    audioPublicId: (type === 'voice' || type === 'audio') ? (audioPublicId || null) : null,
+    audioDuration: (type === 'voice' || type === 'audio') ? (audioDuration || 0) : 0,
+    waveform:      (type === 'voice' || type === 'audio') ? (waveform || []) : [],
+    gifUrl:        type === 'gif' ? gifUrl : null,
+    documentUrl:      type === 'document' ? documentUrl : null,
+    documentPublicId: type === 'document' ? (documentPublicId || null) : null,
+    documentName:     type === 'document' ? (documentName || 'Document') : '',
+    documentSize:     type === 'document' ? (documentSize || 0) : 0,
+    documentMime:     type === 'document' ? (documentMime || '') : '',
+    replyTo:       replyTo       || null,
+    forwardedFrom: forwardedFrom || null,
+    status:        anyoneOnline  ? 'delivered' : 'sent',
+    deliveredAt:   anyoneOnline  ? now : null,
+  });
+}
+
+// Atomic-ish chat metadata update after a send. Uses positional $inc on
+// unreadCount so concurrent sends can't clobber each other.
+async function updateChatAfterSend({ chat, message, senderId }) {
+  const preview = snapshotFor(message);
+  const $inc = {};
+  otherMembers(chat, senderId).forEach(uid => {
+    $inc[`unreadCount.${uid}`] = 1;
+  });
+  await Chat.updateOne(
+    { _id: chat._id },
+    {
+      $set: { lastMessage: preview, updatedAt: new Date() },
+      // Un-archive the chat for anyone it was archived by — a new message
+      // pulls it back to the inbox, mirroring WhatsApp behaviour.
+      $pull: { archivedBy: { $in: chat.members } },
+      ...(Object.keys($inc).length ? { $inc } : {}),
+    },
+  );
+  // Reflect the change on our in-memory chat doc for downstream callers.
+  chat.lastMessage = preview;
+  otherMembers(chat, senderId).forEach(uid => {
+    const cur = chat.unreadCount?.get?.(uid) || 0;
+    chat.unreadCount.set(uid, cur + 1);
+  });
+}
+
+// Export for socket.js
+exports._createMessageDoc      = createMessageDoc;
+exports._updateChatAfterSend   = updateChatAfterSend;
+exports._fanOutNewMessage      = fanOutNewMessage;
+exports._buildMessagePayload   = buildMessagePayload;
+exports._otherMembers          = otherMembers;
+
 // ─────────────────────────────────────────────────────────────────────────────
-// PUT /api/chats/:chatId/read — mark all messages as read
+// PUT /api/chats/:chatId/read
 // ─────────────────────────────────────────────────────────────────────────────
 exports.markAsRead = async (req, res) => {
   try {
@@ -266,15 +444,18 @@ exports.markAsRead = async (req, res) => {
       return fail(res, 'Not a member of this chat', 403);
     }
 
-    // Mark all unseen messages from the OTHER user as seen
     await Message.updateMany(
       { chatId, senderId: { $ne: userId }, status: { $ne: 'seen' } },
       { $set: { status: 'seen', seen: true, seenAt: new Date() } },
     );
 
-    // Reset unread counter for this user
-    chat.unreadCount.set(userId, 0);
-    await chat.save();
+    await Chat.updateOne({ _id: chatId }, { $set: { [`unreadCount.${userId}`]: 0 } });
+
+    // Tell the OTHER sockets their messages were seen.
+    const S = getSocketModule();
+    otherMembers(chat, userId).forEach(uid => {
+      S.emitToUser(uid, 'messageSeen', { chatId, seenBy: userId, seenAt: new Date() });
+    });
 
     return ok(res, { message: 'Marked as read' });
   } catch (err) {
@@ -284,26 +465,307 @@ exports.markAsRead = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DELETE /api/chats/:chatId/messages/:messageId — soft-delete a message
+// DELETE /api/chats/:chatId/messages/:messageId?scope=me|everyone
 // ─────────────────────────────────────────────────────────────────────────────
 exports.deleteMessage = async (req, res) => {
   try {
     const userId = req.user.id;
     const { chatId, messageId } = req.params;
+    const scope = (req.query.scope || 'me').toLowerCase();
 
     const message = await Message.findOne({ _id: messageId, chatId });
     if (!message) return fail(res, 'Message not found', 404);
-    if (message.senderId.toString() !== userId) {
-      return fail(res, 'You can only delete your own messages', 403);
+
+    if (scope === 'everyone') {
+      if (message.senderId.toString() !== userId) {
+        return fail(res, 'Only the sender can delete for everyone', 403);
+      }
+      message.deleted = true;
+      message.text    = '';
+      // Wipe media pointers so the tombstone bubble has nothing to render.
+      message.imageUrl = null;
+      message.audioUrl = null;
+      message.gifUrl   = null;
+      message.documentUrl = null;
+      await message.save();
+
+      // Broadcast so live clients replace the bubble with a tombstone.
+      const S = getSocketModule();
+      S.getIO()?.to(`chat:${chatId}`).emit('messageDeleted', {
+        chatId, messageId: message._id, scope: 'everyone',
+      });
+    } else {
+      // "Delete for me" — hide from this user only.
+      await Message.updateOne({ _id: messageId }, { $addToSet: { deletedFor: userId } });
     }
 
-    message.deleted = true;
-    message.text    = '';
-    await message.save();
-
-    return ok(res, { message: 'Message deleted' });
+    return ok(res, { message: 'Deleted' });
   } catch (err) {
     console.error('deleteMessage error:', err);
     return fail(res, 'Failed to delete message', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/chats/:chatId/messages/:messageId — edit text
+// ─────────────────────────────────────────────────────────────────────────────
+exports.editMessage = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId, messageId } = req.params;
+    const { text } = req.body || {};
+    const trimmed = (text || '').trim();
+    if (!trimmed) return fail(res, 'Text is required');
+
+    const message = await Message.findOne({ _id: messageId, chatId });
+    if (!message) return fail(res, 'Message not found', 404);
+    if (message.senderId.toString() !== userId) return fail(res, 'Not your message', 403);
+    if (message.type !== 'text') return fail(res, 'Only text messages can be edited', 400);
+    if (message.deleted)         return fail(res, 'Deleted messages cannot be edited', 400);
+
+    message.text     = trimmed;
+    message.edited   = true;
+    message.editedAt = new Date();
+    await message.save();
+
+    const S = getSocketModule();
+    S.getIO()?.to(`chat:${chatId}`).emit('messageEdited', {
+      chatId, messageId, text: trimmed, editedAt: message.editedAt,
+    });
+
+    return ok(res, { message });
+  } catch (err) {
+    console.error('editMessage error:', err);
+    return fail(res, 'Failed to edit message', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/chats/:chatId/messages/:messageId/react   { emoji }
+//   Toggles the reaction — sending the same emoji again removes it.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.reactToMessage = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId, messageId } = req.params;
+    const emoji = (req.body?.emoji || '').trim();
+    if (!emoji || emoji.length > 8) return fail(res, 'Invalid emoji');
+
+    const message = await Message.findOne({ _id: messageId, chatId });
+    if (!message) return fail(res, 'Message not found', 404);
+
+    const idx = message.reactions.findIndex(r =>
+      r.userId.toString() === userId && r.emoji === emoji,
+    );
+    if (idx >= 0) message.reactions.splice(idx, 1);
+    else          message.reactions.push({ userId, emoji });
+    await message.save();
+
+    const S = getSocketModule();
+    S.getIO()?.to(`chat:${chatId}`).emit('messageReaction', {
+      chatId, messageId,
+      reactions: message.reactions.map(r => ({ userId: r.userId, emoji: r.emoji })),
+    });
+
+    return ok(res, { reactions: message.reactions });
+  } catch (err) {
+    console.error('reactToMessage error:', err);
+    return fail(res, 'Failed to react', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/chats/:chatId/messages/:messageId/star
+// ─────────────────────────────────────────────────────────────────────────────
+exports.toggleStar = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId, messageId } = req.params;
+    const msg = await Message.findOne({ _id: messageId, chatId });
+    if (!msg) return fail(res, 'Message not found', 404);
+
+    const has = msg.starredBy.some(u => u.toString() === userId);
+    const update = has
+      ? { $pull: { starredBy: userId } }
+      : { $addToSet: { starredBy: userId } };
+    await Message.updateOne({ _id: messageId }, update);
+    return ok(res, { starred: !has });
+  } catch (err) {
+    console.error('toggleStar error:', err);
+    return fail(res, 'Failed to toggle star', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/chats/:chatId/messages/:messageId/pin
+//   Chat-wide pin. Caps at 3 pinned messages per chat (WhatsApp behaviour).
+// ─────────────────────────────────────────────────────────────────────────────
+exports.togglePin = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId, messageId } = req.params;
+    const chat = await Chat.findById(chatId);
+    if (!chat) return fail(res, 'Chat not found', 404);
+    if (!chat.members.some(m => m.toString() === userId)) return fail(res, 'Not a member', 403);
+
+    const msg = await Message.findOne({ _id: messageId, chatId });
+    if (!msg) return fail(res, 'Message not found', 404);
+
+    if (msg.pinned) {
+      msg.pinned = false; msg.pinnedAt = null; msg.pinnedBy = null;
+      await msg.save();
+      await Chat.updateOne({ _id: chatId }, { $pull: { pinnedMessages: { messageId } } });
+    } else {
+      if ((chat.pinnedMessages || []).length >= 3) {
+        return fail(res, 'Only 3 pinned messages allowed. Unpin one first.', 400);
+      }
+      msg.pinned = true; msg.pinnedAt = new Date(); msg.pinnedBy = userId;
+      await msg.save();
+      await Chat.updateOne(
+        { _id: chatId },
+        { $push: { pinnedMessages: { messageId, pinnedAt: msg.pinnedAt, pinnedBy: userId } } },
+      );
+    }
+
+    const S = getSocketModule();
+    S.getIO()?.to(`chat:${chatId}`).emit('messagePinned', {
+      chatId, messageId, pinned: msg.pinned,
+    });
+
+    return ok(res, { pinned: msg.pinned });
+  } catch (err) {
+    console.error('togglePin error:', err);
+    return fail(res, 'Failed to pin', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/chats/:chatId/forward  { messageIds: [...], toChatIds: [...] }
+// ─────────────────────────────────────────────────────────────────────────────
+exports.forwardMessages = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { messageIds = [], toChatIds = [] } = req.body || {};
+    if (!Array.isArray(messageIds) || !messageIds.length) return fail(res, 'messageIds required');
+    if (!Array.isArray(toChatIds)   || !toChatIds.length)  return fail(res, 'toChatIds required');
+
+    const sourceMessages = await Message.find({ _id: { $in: messageIds } }).lean();
+    if (!sourceMessages.length) return fail(res, 'Nothing to forward', 404);
+
+    const targetChats = await Chat.find({ _id: { $in: toChatIds }, members: userId });
+    if (!targetChats.length) return fail(res, 'No accessible target chats', 403);
+
+    // Build one message per (source × target) pair. hops++ prevents ping-pong.
+    for (const chat of targetChats) {
+      for (const source of sourceMessages) {
+        const body = {
+          text: source.text || '',
+          type: source.type,
+          videoId:  source.videoId,
+          imageUrl: source.imageUrl, imagePublicId: source.imagePublicId,
+          imageWidth: source.imageWidth, imageHeight: source.imageHeight,
+          audioUrl: source.audioUrl, audioPublicId: source.audioPublicId,
+          audioDuration: source.audioDuration, waveform: source.waveform,
+          gifUrl: source.gifUrl,
+          documentUrl: source.documentUrl, documentPublicId: source.documentPublicId,
+          documentName: source.documentName, documentSize: source.documentSize, documentMime: source.documentMime,
+          forwardedFrom: {
+            fromUserId:        source.senderId,
+            fromChatId:        source.chatId,
+            originalMessageId: source._id,
+            hops:              Math.min(20, (source.forwardedFrom?.hops || 0) + 1),
+          },
+        };
+        const message = await createMessageDoc({ chat, senderId: userId, body });
+        await updateChatAfterSend({ chat, message, senderId: userId });
+        await fanOutNewMessage({ chat, message, senderId: userId });
+      }
+    }
+
+    return ok(res, { message: 'Forwarded', count: sourceMessages.length * targetChats.length });
+  } catch (err) {
+    console.error('forwardMessages error:', err);
+    return fail(res, 'Failed to forward', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/chats/:chatId/messages/search?q=…
+// ─────────────────────────────────────────────────────────────────────────────
+exports.searchMessages = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.params;
+    const q = (req.query.q || '').trim();
+    if (!q) return ok(res, { messages: [] });
+
+    const chat = await Chat.findById(chatId).select('members').lean();
+    if (!chat) return fail(res, 'Chat not found', 404);
+    if (!chat.members.some(m => m.toString() === userId)) return fail(res, 'Not a member', 403);
+
+    const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const messages = await Message.find({
+      chatId,
+      deleted: false,
+      deletedFor: { $ne: userId },
+      text: { $regex: escaped, $options: 'i' },
+    })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .populate('senderId', 'fullName username profileImage')
+      .lean();
+
+    return ok(res, { messages: messages.reverse() });
+  } catch (err) {
+    console.error('searchMessages error:', err);
+    return fail(res, 'Failed to search', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-chat state — pin / mute / archive / clear
+// ─────────────────────────────────────────────────────────────────────────────
+
+const toggleUserFlag = (field) => async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.params;
+    const chat = await Chat.findById(chatId).select('members').lean();
+    if (!chat) return fail(res, 'Chat not found', 404);
+    if (!chat.members.some(m => m.toString() === userId)) return fail(res, 'Not a member', 403);
+
+    const already = await Chat.exists({ _id: chatId, [field]: userId });
+    const update = already
+      ? { $pull: { [field]: userId } }
+      : { $addToSet: { [field]: userId } };
+    await Chat.updateOne({ _id: chatId }, update);
+    return ok(res, { [field.replace('By', '')]: !already });
+  } catch (err) {
+    console.error(`toggle ${field} error:`, err);
+    return fail(res, 'Failed', 500);
+  }
+};
+
+exports.togglePinChat    = toggleUserFlag('pinnedBy');
+exports.toggleMuteChat   = toggleUserFlag('mutedBy');
+exports.toggleArchive    = toggleUserFlag('archivedBy');
+
+// Clear-history — only for the requesting user; other members keep the messages.
+exports.clearChat = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.params;
+    const chat = await Chat.findById(chatId).select('members').lean();
+    if (!chat) return fail(res, 'Chat not found', 404);
+    if (!chat.members.some(m => m.toString() === userId)) return fail(res, 'Not a member', 403);
+
+    await Chat.updateOne(
+      { _id: chatId },
+      { $set: { [`clearedAt.${userId}`]: new Date(), [`unreadCount.${userId}`]: 0 } },
+    );
+    return ok(res, { message: 'Chat cleared for you' });
+  } catch (err) {
+    console.error('clearChat error:', err);
+    return fail(res, 'Failed to clear chat', 500);
   }
 };
