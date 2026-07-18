@@ -1,19 +1,13 @@
 // Backend/routes/ActivityRoutes.js
 //
-// All "My Activity" endpoints. Mounted at /api/activity/* in server.js.
+// All "My Activity" endpoints (viewed profiles, shared videos, search history,
+// comments history). Mounted at /api/activity/* in server.js.
 // Every route is JWT-protected — activity data is per-user and private.
 
 const express = require('express');
 const router  = express.Router();
 const { protect } = require('../middleware/Auth');
 const A = require('../controllers/ActivityController');
-
-// ── Watch History ───────────────────────────────────────────────────────────
-router.get   ('/watch-history',              protect, A.listWatch);
-router.post  ('/watch-history',              protect, A.recordWatch);
-router.post  ('/watch-history/bulk-delete',  protect, A.bulkDeleteWatch);
-router.delete('/watch-history',              protect, A.clearWatch);
-router.delete('/watch-history/:videoId',     protect, A.deleteWatch);
 
 // ── Viewed Profiles ─────────────────────────────────────────────────────────
 router.get   ('/viewed-profiles',             protect, A.listProfileViews);
@@ -26,6 +20,9 @@ router.get   ('/shared-videos',     protect, A.listShares);
 router.post  ('/shared-videos',     protect, A.recordShare);
 router.delete('/shared-videos',     protect, A.clearShares);
 router.delete('/shared-videos/:id', protect, A.deleteShare);
+
+// ── Comments History ────────────────────────────────────────────────────────
+router.get   ('/comments', protect, A.listMyComments);
 
 // ── Search History ──────────────────────────────────────────────────────────
 router.get   ('/search-history',     protect, A.listSearches);

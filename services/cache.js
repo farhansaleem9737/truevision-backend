@@ -82,6 +82,67 @@ const delByPrefix = async (pattern) => {
   }
 };
 
+// ── Scoped invalidation via a per-scope key registry ───────────────────────
+//
+// Problem: feed cache keys embed the viewerId in the MIDDLE
+// (video:feed:<sort>:<cat>:<viewerId>:<page>:<limit>), so a prefix delete
+// can't target one user without SCANning the whole keyspace — and wiping
+// EVERY user's feed on one person's preference change doesn't scale.
+//
+// Solution: when we cache a key for a user, also record it in a small Redis
+// SET (the "scope"). Invalidating that user then means: read the set, delete
+// exactly those keys, delete the set. O(keys-for-this-user), zero keyspace
+// scan — safe at thousands of concurrent users.
+
+/**
+ * Register `memberKey` under the registry SET `setKey` so the scope can be
+ * invalidated later without scanning. Best-effort; never throws. The set is
+ * given its own TTL (slightly longer than the members') so it self-cleans.
+ */
+const trackKey = async (setKey, memberKey, ttlSeconds) => {
+  if (!isReady() || !setKey || !memberKey) return;
+  try {
+    await client.multi()
+      .sadd(setKey, memberKey)
+      .expire(setKey, Math.max(ttlSeconds || 60, 60))
+      .exec();
+  } catch (e) {
+    console.warn('[cache.trackKey] failed:', setKey, e.message);
+  }
+};
+
+/**
+ * Invalidate a scope: delete every key registered under `setKey`, plus any
+ * `extraKeys`, plus the registry set itself. AWAITED and reliable — one retry
+ * on a transient error, then it throws so the caller can react (e.g. roll back
+ * a write). When Redis is down there is nothing cached to be stale, so this
+ * resolves successfully as a no-op.
+ *
+ * @returns {Promise<{cleared:number, degraded:boolean}>}
+ */
+const invalidateScope = async (setKey, extraKeys = []) => {
+  if (!isReady()) return { cleared: 0, degraded: true };
+
+  const run = async () => {
+    const members = await client.smembers(setKey);
+    const keys = [...members, ...extraKeys, setKey].filter(Boolean);
+    if (keys.length) await client.del(keys);
+    return keys.length;
+  };
+
+  try {
+    return { cleared: await run(), degraded: false };
+  } catch (first) {
+    // Single retry — covers a transient blip without masking a real outage.
+    try {
+      return { cleared: await run(), degraded: false };
+    } catch (second) {
+      console.error('[cache.invalidateScope] failed after retry:', setKey, second.message);
+      throw second;
+    }
+  }
+};
+
 // ── High-level pattern: cache-aside with loader fallback ───────────────────
 
 /**
@@ -140,6 +201,7 @@ const setNX = async (key, value, ttlSeconds) => {
 
 module.exports = {
   get, set, del, delByPrefix,
+  trackKey, invalidateScope,
   withCache,
   incr, setNX,
   // Direct client access — reserve for low-level ops (SADD, HINCRBY, etc.)

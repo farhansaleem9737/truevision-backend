@@ -3,7 +3,15 @@ const User       = require('../models/User');
 const Video      = require('../models/Video');
 const cloudinary = require('../config/cloudinary');
 const cache      = require('../services/cache');
+const feedCache  = require('../services/feedCache');
+const privacy    = require('../services/privacy');
 const { resolveKind } = require('../services/cloudinaryFolders');
+
+// socket.js is required lazily (on first use, not at module load) to avoid a
+// circular import at boot. broadcastOnlineStatus is a newer export, so every
+// call site guards with a typeof check and degrades gracefully without it.
+let sock;
+const getSock = () => sock || (sock = require('../socket'));
 
 const kUser = (id) => `user:byId:${id}`;
 const TTL_USER = 60; // 1 min — profile edits, follow counts change often
@@ -19,8 +27,8 @@ const DEFAULT_PREFS = {
     privateAccount:   false,
     hideOnlineStatus: false,
     hideFollowers:    false,
-    whoCanMessage:    'everyone',  // 'everyone' | 'followers' | 'nobody'
-    whoCanComment:    'everyone',
+    whoCanMessage:    'everyone',  // 'everyone' | 'followers' | 'mutual' | 'nobody'
+    whoCanComment:    'everyone',  // 'everyone' | 'followers' | 'mutual' | 'nobody'
   },
   notifications: {
     likes:           true,
@@ -69,6 +77,7 @@ const safeUser = (u, extras = {}) => ({
   createdAt:            u.createdAt,
   followersCount:       u.followers?.length || 0,
   followingCount:       u.following?.length || 0,
+  language:             u.language || 'en',
   preferences:          deepMerge(DEFAULT_PREFS, u.preferences || {}),
   ...extras,
 });
@@ -81,10 +90,13 @@ exports.searchUsers = async (req, res) => {
   try {
     const q = (req.query.q || '').trim();
 
-    // Always exclude self. When q is empty we still return a list — the chat
-    // screen uses this to show "people you can chat with" before the user has
-    // any conversations. With a query we filter by username / fullName regex.
-    const filter = { _id: { $ne: req.user.id } };
+    // Always exclude self AND every blocked pair (either direction) — blocked
+    // users must never surface in search. When q is empty we still return a
+    // list — the chat screen uses this to show "people you can chat with"
+    // before the user has any conversations. With a query we filter by
+    // username / fullName regex.
+    const excluded = await privacy.blockedIdSetFor(req.user.id);
+    const filter = { _id: { $nin: [req.user.id, ...excluded] } };
     if (q.length > 0) {
       // Escape regex metacharacters so a username with "." or "*" doesn't blow up
       const safe = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -98,13 +110,17 @@ exports.searchUsers = async (req, res) => {
       ? { username: 1 }
       : { lastSeen: -1, createdAt: -1 };
 
+    // `preferences` is selected ONLY so applyPresencePolicy can consult
+    // hideOnlineStatus — the policy helper strips it before it reaches the wire.
     const users = await User.find(filter)
-      .select('fullName username profileImage bio isVerified isOnline lastSeen')
+      .select('fullName username profileImage bio isVerified isOnline lastSeen preferences')
       .sort(sort)
       .limit(q.length > 0 ? 20 : 30)
       .lean();
 
-    return ok(res, { users });
+    return ok(res, {
+      users: users.map((u) => privacy.applyPresencePolicy(u, req.user.id)),
+    });
   } catch (err) {
     console.error('searchUsers error:', err);
     return fail(res, 'Search failed', 500);
@@ -128,7 +144,12 @@ exports.getMe = async (req, res) => {
         status: { $ne: 'deleted' },
       });
 
-      return safeUser(user, { totalVideos });
+      return safeUser(user, {
+        totalVideos,
+        // Badge count for the "Follow Requests" entry point (private accounts).
+        // Every request write path invalidates user:byId:<id>, so this stays fresh.
+        pendingRequestsCount: user.followRequests?.length || 0,
+      });
     });
 
     if (!payload) return fail(res, 'User not found', 404);
@@ -303,8 +324,70 @@ exports.updateProfile = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // UPDATE PREFERENCES (privacy / notifications / content / language)
 // PUT /api/users/preferences
-// Body: partial preferences object — deep-merged with existing.
+// Body: partial preferences object — whitelist-validated, then deep-merged.
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Whitelist-based sanitizer for preference patches. Only known keys survive
+// (unknown keys are silently dropped) and every value is validated/coerced:
+//   privacy.*        booleans coerced with `=== true` (only when present);
+//                    whoCanMessage/whoCanComment restricted to AUDIENCE_VALUES
+//   notifications.*  known boolean keys from DEFAULT_PREFS.notifications
+//   content.*        known keys; booleans, except interestedTopics which is
+//                    an array of strings (each ≤40 chars, max 30 items)
+//   language         non-empty string, ≤10 chars
+// Returns a patch that is safe to deep-merge into the Mixed blob.
+const sanitizePreferencesPatch = (patch) => {
+  const out = {};
+  const isPlainObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+  if (isPlainObject(patch.privacy)) {
+    const p = {};
+    for (const k of ['privateAccount', 'hideOnlineStatus', 'hideFollowers']) {
+      if (k in patch.privacy) p[k] = patch.privacy[k] === true;
+    }
+    for (const k of ['whoCanMessage', 'whoCanComment']) {
+      if (k in patch.privacy && privacy.AUDIENCE_VALUES.includes(patch.privacy[k])) {
+        p[k] = patch.privacy[k];
+      }
+    }
+    if (Object.keys(p).length) out.privacy = p;
+  }
+
+  if (isPlainObject(patch.notifications)) {
+    const n = {};
+    for (const k of Object.keys(DEFAULT_PREFS.notifications)) {
+      if (k in patch.notifications) n[k] = patch.notifications[k] === true;
+    }
+    if (Object.keys(n).length) out.notifications = n;
+  }
+
+  if (isPlainObject(patch.content)) {
+    const c = {};
+    for (const k of Object.keys(DEFAULT_PREFS.content)) {
+      if (!(k in patch.content)) continue;
+      if (k === 'interestedTopics') {
+        if (Array.isArray(patch.content[k])) {
+          c[k] = patch.content[k]
+            .filter((t) => typeof t === 'string')
+            .map((t) => t.trim().slice(0, 40))
+            .filter((t) => t.length > 0)
+            .slice(0, 30);
+        }
+      } else {
+        c[k] = patch.content[k] === true;
+      }
+    }
+    if (Object.keys(c).length) out.content = c;
+  }
+
+  if (typeof patch.language === 'string') {
+    const lang = patch.language.trim();
+    if (lang.length > 0 && lang.length <= 10) out.language = lang;
+  }
+
+  return out;
+};
+
 exports.updatePreferences = async (req, res) => {
   try {
     const patch = req.body || {};
@@ -312,13 +395,103 @@ exports.updatePreferences = async (req, res) => {
       return fail(res, 'Body must be a preferences object');
     }
 
+    // Validate BEFORE merging — malformed/unknown keys never reach the blob.
+    const clean = sanitizePreferencesPatch(patch);
+    if (!Object.keys(clean).length) {
+      return fail(res, 'No valid preference fields in request');
+    }
+
     const user = await User.findById(req.user.id);
     if (!user) return fail(res, 'User not found', 404);
 
-    const merged = deepMerge(user.preferences || {}, patch);
+    // Snapshot for rollback: a deep clone of the preferences BEFORE the merge.
+    // If the feed-cache invalidation below fails we restore this so the DB can
+    // never be left ahead of a still-stale cache.
+    const prefsSnapshot = JSON.parse(JSON.stringify(user.preferences || {}));
+
+    // Snapshot privacy BEFORE the merge so transitions are detectable below.
+    const before = privacy.getPrivacy(user);
+
+    const merged = deepMerge(user.preferences || {}, clean);
     user.preferences = merged;
     user.markModified('preferences');
     await user.save();
+
+    const after  = privacy.getPrivacy(user);
+    const userId = String(user._id);
+
+    // ── Recommendation cache invalidation (AWAITED · per-user · rollback-safe) ─
+    // Only recommendation-affecting keys (personalizedRecs / hideSensitive /
+    // interestedTopics) touch the feed cache — playback toggles (autoplay,
+    // hdOnWifi, dataSaver) are deliberately excluded. We AWAIT the invalidation
+    // so success is returned only after this viewer's cached feed + pool are
+    // gone; the frontend can then refetch and never sees a stale feed.
+    if (feedCache.affectsRecommendations(clean.content)) {
+      try {
+        await feedCache.invalidateUserFeed(userId);
+      } catch (err) {
+        // Redis is up but the delete failed. Restore the previous preferences
+        // so the DB isn't left updated while the cache still serves the old
+        // feed — no inconsistent state — and tell the client to roll back.
+        console.error('[updatePreferences] feed cache invalidation failed — rolling back:', err.message);
+        try {
+          user.preferences = prefsSnapshot;
+          user.markModified('preferences');
+          await user.save();
+        } catch (rbErr) {
+          console.error('[updatePreferences] rollback save failed:', rbErr.message);
+        }
+        return res.status(503).json({
+          success: false,
+          code:    'CACHE_SYNC_FAILED',
+          message: 'Could not apply your change right now. Please try again.',
+        });
+      }
+    }
+
+    // ── Presence side-effects (best-effort — never fail the request) ─────────
+    try {
+      const s = getSock();
+      if (typeof s.broadcastOnlineStatus === 'function') {
+        // Hiding online status: chat partners immediately see the user go
+        // offline, with lastSeen suppressed (null).
+        if (!before.hideOnlineStatus && after.hideOnlineStatus) {
+          s.broadcastOnlineStatus(userId, false, null);
+        }
+        // Un-hiding while actually connected: partners see them come back.
+        if (before.hideOnlineStatus && !after.hideOnlineStatus && s.presenceIsOnline(userId)) {
+          s.broadcastOnlineStatus(userId, true);
+        }
+      }
+    } catch (e) {
+      console.warn('updatePreferences: presence broadcast skipped:', e.message);
+    }
+
+    // ── Going public: auto-accept every pending follow request ───────────────
+    // Two bulk writes instead of N round-trips: my doc gains all requesters
+    // as followers (and drops the queue), each requester gains me in following.
+    if (before.privateAccount && !after.privateAccount && user.followRequests?.length) {
+      const requesterIds = user.followRequests.map((r) => r.from).filter(Boolean);
+      await Promise.all([
+        User.updateOne(
+          { _id: user._id },
+          {
+            $addToSet: { followers: { $each: requesterIds } },
+            // Only the snapshotted, auto-accepted requests are removed —
+            // requests that arrive concurrently survive for manual review.
+            $pull:     { followRequests: { from: { $in: requesterIds } } },
+          },
+        ),
+        User.updateMany(
+          { _id: { $in: requesterIds } },
+          { $addToSet: { following: user._id } },
+        ),
+      ]);
+      // updateOne/updateMany bypass the model's cache hook — invalidate manually.
+      await Promise.all(
+        [userId, ...requesterIds.map(String)].map((id) => invalidateUserCache(id)),
+      );
+    }
 
     return ok(res, {
       message:     'Preferences updated',

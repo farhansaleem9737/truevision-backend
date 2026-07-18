@@ -19,9 +19,18 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+import os
+import shutil
+import tempfile
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+import httpx
+from fastapi import (
+    Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status,
+)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -31,8 +40,10 @@ from fastapi.middleware.cors import CORSMiddleware
 # relative imports would cause when main.py is loaded as a script.
 import chatbot
 import classifier
+import ffmpeg_utils
 import moderator
 import recommender
+import whisper
 from config import settings
 from schemas import (
     ChatRequest,
@@ -43,6 +54,7 @@ from schemas import (
     PredictResponse,
     RecommendRequest,
     RecommendResponse,
+    TranscribeResponse,
 )
 
 logging.basicConfig(
@@ -54,9 +66,10 @@ logger = logging.getLogger("truevision.ai")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Warm up the DistilBERT model on startup so the first /predict call
-    isn't cold. NudeNet, sentence-transformers and the recommender stay
-    lazy — they only pay their load cost when their endpoint is first hit."""
+    """Warm up DistilBERT + Faster-Whisper on startup so the first request
+    isn't cold, and so both models are loaded exactly ONCE per process and
+    reused for every request. NudeNet, sentence-transformers and the
+    recommender stay lazy — they pay their load cost on first hit."""
     try:
         await run_in_threadpool(classifier.load)
         logger.info("DistilBERT pre-warmed.")
@@ -64,6 +77,20 @@ async def lifespan(app: FastAPI):
         # Don't crash the service if the model dir is missing — /predict
         # will return 503 until the user drops the files in.
         logger.warning("DistilBERT not loaded: %s", e)
+    except Exception as e:  # noqa: BLE001 — e.g. weights absent from the dir
+        logger.warning("DistilBERT not loaded: %s", e)
+
+    # Whisper downloads its weights on first load; do it at startup so no user
+    # request pays for it. A failure here is non-fatal — /transcribe 503s.
+    try:
+        await run_in_threadpool(whisper.load)
+        logger.info("Faster-Whisper pre-warmed (%s).", settings.whisper_model)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Faster-Whisper not loaded: %s", e)
+
+    if not ffmpeg_utils.ffmpeg_available():
+        logger.warning("FFmpeg not on PATH — /transcribe will return 503.")
+
     yield
     logger.info("Shutdown complete.")
 
@@ -108,7 +135,16 @@ def health():
     return {
         "status": "ok",
         "model_dir_present": settings.model_dir_exists,
+        # Distinguishes "folder exists" from "weights actually present" —
+        # a dir with only config/tokenizer files cannot load.
+        "model_weights_present": settings.model_weights_exist,
+        "distilbert_loaded": classifier.is_ready(),
         "model_dir": settings.model_dir,
+        # Transcription pipeline readiness.
+        "ffmpeg_available": ffmpeg_utils.ffmpeg_available(),
+        "ffmpeg_version": ffmpeg_utils.ffmpeg_version(),
+        "whisper_model": settings.whisper_model,
+        "whisper_loaded": whisper.is_ready(),
     }
 
 
@@ -150,3 +186,151 @@ async def chat(req: ChatRequest) -> ChatResponse:
     except Exception as e:  # noqa: BLE001
         logger.exception("/chatbot failed")
         raise HTTPException(status_code=500, detail=f"chat failed: {e}")
+
+
+# ── /transcribe ─────────────────────────────────────────────────────────────
+#
+# Pipeline:  video → FFmpeg (audio.wav) → Faster-Whisper (text) → DistilBERT
+#            (category + confidence) → JSON
+#
+# Accepts EITHER:
+#   • multipart/form-data with `file` (raw video bytes), or
+#   • multipart/form-data / query with `video_url` (Cloudinary URL — the path
+#     Node uses, keeping this service stateless like /moderate).
+#
+# Both models are already resident (loaded at startup) — nothing reloads here.
+
+async def _download_to(path: Path, url: str) -> None:
+    """Stream a remote video to disk, enforcing the size cap as we go."""
+    limit = settings.max_video_mb * 1024 * 1024
+    written = 0
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with client.stream("GET", url, timeout=settings.fetch_timeout) as r:
+            if r.status_code != 200:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"could not fetch video_url (HTTP {r.status_code})",
+                )
+            with open(path, "wb") as fh:
+                async for chunk in r.aiter_bytes(1024 * 256):
+                    written += len(chunk)
+                    if written > limit:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"video exceeds {settings.max_video_mb} MB limit",
+                        )
+                    fh.write(chunk)
+    if written == 0:
+        raise HTTPException(status_code=400, detail="downloaded video is empty")
+
+
+@app.post("/transcribe", response_model=TranscribeResponse, dependencies=[Depends(require_api_key)])
+async def transcribe(
+    file: Optional[UploadFile] = File(default=None),
+    video_url: Optional[str] = Form(default=None),
+    video_id: Optional[str] = Form(default=None),
+) -> TranscribeResponse:
+    if not file and not video_url:
+        raise HTTPException(status_code=400, detail="provide either `file` or `video_url`")
+
+    started = time.perf_counter()
+    # One temp dir per request — audio.wav lives here and is removed in `finally`.
+    workdir = tempfile.mkdtemp(prefix="tv_transcribe_")
+    video_path = Path(workdir) / "input"
+    audio_path = Path(workdir) / "audio.wav"
+
+    try:
+        # 1. Materialise the video locally.
+        if file:
+            limit = settings.max_video_mb * 1024 * 1024
+            written = 0
+            with open(video_path, "wb") as fh:
+                while chunk := await file.read(1024 * 256):
+                    written += len(chunk)
+                    if written > limit:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"video exceeds {settings.max_video_mb} MB limit",
+                        )
+                    fh.write(chunk)
+            if written == 0:
+                raise HTTPException(status_code=400, detail="uploaded file is empty")
+        else:
+            await _download_to(video_path, video_url)
+
+        # 2. FFmpeg: extract 16 kHz mono WAV. Blocking → threadpool.
+        await run_in_threadpool(ffmpeg_utils.extract_audio, str(video_path), str(audio_path))
+
+        # 3. Faster-Whisper: speech → text (CPU/GPU bound → threadpool).
+        result = await run_in_threadpool(whisper.transcribe, str(audio_path))
+        transcript = (result.get("text") or "").strip()
+
+        # 4. Empty transcript is a valid outcome (silent / music-only video):
+        #    return 200 with empty=True rather than pretending to classify it.
+        if not transcript:
+            return TranscribeResponse(
+                transcript="",
+                category=None,
+                confidence=0.0,
+                language=result.get("language", ""),
+                language_probability=result.get("language_probability", 0.0),
+                duration=result.get("duration", 0.0),
+                processing_time=round(time.perf_counter() - started, 3),
+                empty=True,
+                video_id=video_id,
+            )
+
+        # 5. Existing DistilBERT classifier — unchanged, just fed the transcript.
+        #    If the classifier is unavailable (e.g. weights were never exported)
+        #    we still return the transcript: Whisper's work is independently
+        #    valuable and must not be discarded because of a downstream gap.
+        #    /predict remains the endpoint that hard-503s in that situation.
+        prediction: dict = {}
+        classifier_error: Optional[str] = None
+        try:
+            prediction = await run_in_threadpool(classifier.predict, transcript)
+        except Exception as e:  # noqa: BLE001 — missing weights, OOM, etc.
+            classifier_error = str(e)
+            logger.warning("Classification skipped: %s", e)
+
+        return TranscribeResponse(
+            transcript=transcript,
+            category=prediction.get("category"),
+            confidence=float(prediction.get("confidence", 0.0)),
+            all_scores=prediction.get("all_scores", {}),
+            classifier_error=classifier_error,
+            language=result.get("language", ""),
+            language_probability=result.get("language_probability", 0.0),
+            duration=result.get("duration", 0.0),
+            processing_time=round(time.perf_counter() - started, 3),
+            empty=False,
+            video_id=video_id,
+            segments=result.get("segments", []),
+        )
+
+    # ── Typed error → correct HTTP status ───────────────────────────────────
+    except ffmpeg_utils.FFmpegMissingError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ffmpeg_utils.NoAudioStreamError as e:
+        # Nothing to transcribe, but the video itself is fine → not an error.
+        return TranscribeResponse(
+            transcript="", category=None, confidence=0.0, empty=True,
+            processing_time=round(time.perf_counter() - started, 3),
+            video_id=video_id,
+        )
+    except ffmpeg_utils.UnsupportedVideoError as e:
+        raise HTTPException(status_code=415, detail=str(e))
+    except ffmpeg_utils.CorruptVideoError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except whisper.WhisperLoadError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except FileNotFoundError as e:
+        # DistilBERT model dir/weights missing.
+        raise HTTPException(status_code=503, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.exception("/transcribe failed")
+        raise HTTPException(status_code=500, detail=f"transcription failed: {e}")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)

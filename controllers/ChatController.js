@@ -9,6 +9,7 @@ const Chat     = require('../models/Chat');
 const Message  = require('../models/Message');
 const User     = require('../models/User');
 const push     = require('../services/pushService');
+const privacy  = require('../services/privacy');
 
 let socketModule = null;
 const getSocketModule = () => {
@@ -76,22 +77,31 @@ const fanOutNewMessage = async ({ chat, message, senderId }) => {
     .filter(uid => !mutedSet.has(uid))
     .filter(uid => !S.presenceIsOnline(uid));
 
-  if (recipients.length && push.available()) {
-    const users = await User.find({ _id: { $in: recipients } })
-      .select('expoPushTokens fcmTokens')
-      .lean();
+  if (recipients.length) {
+    // Route through notificationCenter.notifyMany: enforces each recipient's
+    // preferences.notifications.messages toggle, writes in-app history rows,
+    // and attaches unread badges — in a FIXED number of queries rather than
+    // 4 per recipient (matters for group chats). Chat-level mute + presence
+    // were already filtered above.
+    const notificationCenter = require('../services/notificationCenter');
     const sender = populated.senderId || {};
     const title = chat.type === 'group'
       ? `${sender.username || 'Someone'} • ${chat.groupName || 'Group'}`
       : sender.username || 'New message';
-    await Promise.all(users.map(u => push.sendChatNotification(u, {
-      title,
-      body:      push.previewFor(message),
+    const body = push.previewFor(message);
+    const data = {
       chatId:    chat._id.toString(),
       senderId:  senderId.toString(),
       messageId: message._id.toString(),
       type:      message.type,
-    })));
+    };
+
+    await notificationCenter.notifyMany(
+      recipients,
+      'messages',
+      () => ({ title, body, data }),
+      { fromUserId: senderId },
+    );
   }
 };
 
@@ -108,14 +118,17 @@ exports.getMyChats = async (req, res) => {
     else                  query.archivedBy = userId;
 
     const chats = await Chat.find(query)
-      .populate('members', 'fullName username profileImage isOnline lastSeen isVerified')
+      .populate('members', 'fullName username profileImage isOnline lastSeen isVerified preferences')
       .populate('lastMessage.senderId', 'username')
       .sort({ updatedAt: -1 })
       .lean();
 
     // Shape each chat for the client — includes user-specific flags.
     const shaped = chats.map((chat) => {
-      const other = chat.members.find(m => m._id.toString() !== userId);
+      // Presence policy: members who hide their online status come back with
+      // isOnline=false / lastSeen=null (and the raw preferences blob stripped).
+      const members = (chat.members || []).map(m => privacy.applyPresencePolicy(m, userId));
+      const other = members.find(m => m._id.toString() !== userId);
       const unreadCount = chat.unreadCount?.[userId] || 0;
       return {
         _id:         chat._id,
@@ -123,7 +136,7 @@ exports.getMyChats = async (req, res) => {
         otherUser:   other || { _id: null, fullName: 'Deleted User', username: 'deleted', profileImage: null },
         groupName:   chat.groupName,
         groupImage:  chat.groupImage,
-        members:     chat.type === 'group' ? chat.members : undefined,
+        members:     chat.type === 'group' ? members : undefined,
         lastMessage: chat.lastMessage,
         unreadCount,
         // Per-user derived state.
@@ -160,21 +173,30 @@ exports.createOrGetChat = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(otherId)) return fail(res, 'Invalid userId');
 
     const otherUser = await User.findById(otherId)
-      .select('fullName username profileImage isOnline lastSeen isVerified');
+      .select('followers following preferences blockedUsers');
     if (!otherUser) return fail(res, 'User not found', 404);
 
     let chat = await Chat.findOne({
       type: 'single',
       members: { $all: [myId, otherId], $size: 2 },
-    }).populate('members', 'fullName username profileImage isOnline lastSeen isVerified');
+    }).populate('members', 'fullName username profileImage isOnline lastSeen isVerified preferences');
 
     if (!chat) {
+      // Messaging policy gates NEW conversations only — an existing chat can
+      // still be opened (each send is re-checked separately in sendMessage).
+      const verdict = await privacy.canMessage(myId, otherUser);
+      if (!verdict.allowed) {
+        return res.status(403).json({ success: false, code: verdict.code, message: verdict.message });
+      }
       chat = await Chat.create({ type: 'single', members: [myId, otherId] });
       chat = await Chat.findById(chat._id)
-        .populate('members', 'fullName username profileImage isOnline lastSeen isVerified');
+        .populate('members', 'fullName username profileImage isOnline lastSeen isVerified preferences');
     }
 
-    const other = chat.members.find(m => m._id.toString() !== myId);
+    const other = privacy.applyPresencePolicy(
+      chat.members.find(m => m._id.toString() !== myId),
+      myId,
+    );
 
     return ok(res, {
       chat: {
@@ -222,7 +244,9 @@ exports.createGroup = async (req, res) => {
     });
 
     chat = await Chat.findById(chat._id)
-      .populate('members', 'fullName username profileImage isOnline lastSeen isVerified');
+      .populate('members', 'fullName username profileImage isOnline lastSeen isVerified preferences')
+      .lean();
+    chat.members = chat.members.map(m => privacy.applyPresencePolicy(m, myId));
 
     return ok(res, { chat }, 201);
   } catch (err) {
@@ -316,6 +340,19 @@ exports.sendMessage = async (req, res) => {
       return fail(res, 'Not a member of this chat', 403);
     }
 
+    // Messaging policy — re-checked on EVERY 1-on-1 send because settings
+    // (whoCanMessage, blocks) can change after the chat exists. Groups skip it.
+    if (chat.type === 'single') {
+      const otherId = otherMembers(chat, userId)[0];
+      const other = otherId
+        ? await User.findById(otherId).select('followers following preferences blockedUsers')
+        : null;
+      const verdict = await privacy.canMessage(userId, other);
+      if (!verdict.allowed) {
+        return res.status(403).json({ success: false, code: verdict.code, message: verdict.message });
+      }
+    }
+
     const message = await createMessageDoc({ chat, senderId: userId, body });
 
     // Persist chat metadata + bump unread for every other member.
@@ -372,7 +409,9 @@ async function createMessageDoc({ chat, senderId, body }) {
   return Message.create({
     chatId:  chat._id,
     senderId,
-    clientMsgId: clientMsgId || null,
+    // undefined (not null) when absent — the sparse unique index skips only
+    // MISSING fields; an explicit null would be indexed and collide.
+    clientMsgId: clientMsgId || undefined,
     text:    text?.trim() || '',
     type,
     videoId:  type === 'video' ? videoId : null,
@@ -421,6 +460,20 @@ async function updateChatAfterSend({ chat, message, senderId }) {
     const cur = chat.unreadCount?.get?.(uid) || 0;
     chat.unreadCount.set(uid, cur + 1);
   });
+
+  // Sharing a video into a chat is a share event for the activity screen.
+  // Fire-and-forget — a logging failure must never fail the send. The model
+  // is lazy-required here to avoid an import cycle at module load.
+  if (message.type === 'video' && message.videoId) {
+    const SharedVideo = require('../models/SharedVideo');
+    const others = otherMembers(chat, senderId);
+    SharedVideo.create({
+      userId:   senderId,
+      videoId:  message.videoId,
+      platform: 'chat',
+      toUserId: chat.type === 'single' ? (others[0] || null) : null,
+    }).catch(() => {});
+  }
 }
 
 // Export for socket.js
@@ -551,6 +604,18 @@ exports.reactToMessage = async (req, res) => {
     const emoji = (req.body?.emoji || '').trim();
     if (!emoji || emoji.length > 8) return fail(res, 'Invalid emoji');
 
+    const chat = await Chat.findById(chatId).select('type members').lean();
+    if (!chat) return fail(res, 'Chat not found', 404);
+    if (!chat.members.some(m => m.toString() === userId)) return fail(res, 'Not a member', 403);
+
+    // In 1:1 chats a block in either direction disables interactions.
+    if (chat.type === 'single') {
+      const otherId = otherMembers(chat, userId)[0];
+      if (otherId && await privacy.isBlockedBetween(userId, otherId)) {
+        return fail(res, 'You cannot interact with this content.', 403);
+      }
+    }
+
     const message = await Message.findOne({ _id: messageId, chatId });
     if (!message) return fail(res, 'Message not found', 404);
 
@@ -581,6 +646,10 @@ exports.toggleStar = async (req, res) => {
   try {
     const userId = req.user.id;
     const { chatId, messageId } = req.params;
+    const chat = await Chat.findById(chatId).select('members').lean();
+    if (!chat) return fail(res, 'Chat not found', 404);
+    if (!chat.members.some(m => m.toString() === userId)) return fail(res, 'Not a member', 403);
+
     const msg = await Message.findOne({ _id: messageId, chatId });
     if (!msg) return fail(res, 'Message not found', 404);
 
@@ -649,14 +718,33 @@ exports.forwardMessages = async (req, res) => {
     if (!Array.isArray(messageIds) || !messageIds.length) return fail(res, 'messageIds required');
     if (!Array.isArray(toChatIds)   || !toChatIds.length)  return fail(res, 'toChatIds required');
 
-    const sourceMessages = await Message.find({ _id: { $in: messageIds } }).lean();
+    let sourceMessages = await Message.find({ _id: { $in: messageIds } }).lean();
+    if (!sourceMessages.length) return fail(res, 'Nothing to forward', 404);
+
+    // Only messages from chats the requester belongs to may be forwarded —
+    // otherwise arbitrary message ids could be exfiltrated.
+    const sourceChatIds = [...new Set(sourceMessages.map(m => String(m.chatId)))];
+    const memberSourceChats = await Chat.find({ _id: { $in: sourceChatIds }, members: userId }).select('_id');
+    const memberSourceSet = new Set(memberSourceChats.map(c => String(c._id)));
+    sourceMessages = sourceMessages.filter(m => memberSourceSet.has(String(m.chatId)));
     if (!sourceMessages.length) return fail(res, 'Nothing to forward', 404);
 
     const targetChats = await Chat.find({ _id: { $in: toChatIds }, members: userId });
     if (!targetChats.length) return fail(res, 'No accessible target chats', 403);
 
     // Build one message per (source × target) pair. hops++ prevents ping-pong.
+    let created = 0;
+    let skipped = 0;
     for (const chat of targetChats) {
+      // Respect messaging privacy per target: blocks and whoCanMessage.
+      if (chat.type === 'single') {
+        const otherId = otherMembers(chat, userId)[0];
+        if (otherId) {
+          const other = await User.findById(otherId).select('followers following preferences blockedUsers');
+          const verdict = await privacy.canMessage(userId, other);
+          if (!verdict.allowed) { skipped += 1; continue; }
+        }
+      }
       for (const source of sourceMessages) {
         const body = {
           text: source.text || '',
@@ -679,10 +767,11 @@ exports.forwardMessages = async (req, res) => {
         const message = await createMessageDoc({ chat, senderId: userId, body });
         await updateChatAfterSend({ chat, message, senderId: userId });
         await fanOutNewMessage({ chat, message, senderId: userId });
+        created += 1;
       }
     }
 
-    return ok(res, { message: 'Forwarded', count: sourceMessages.length * targetChats.length });
+    return ok(res, { message: 'Forwarded', count: created, skipped });
   } catch (err) {
     console.error('forwardMessages error:', err);
     return fail(res, 'Failed to forward', 500);

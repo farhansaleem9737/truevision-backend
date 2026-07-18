@@ -105,6 +105,30 @@ const videoSchema = new mongoose.Schema({
   allowDownload: { type: Boolean, default: true  },
   allowComments: { type: Boolean, default: true  },
   allowDuet:     { type: Boolean, default: true  },
+  allowRemix:    { type: Boolean, default: true  },
+
+  // ── Privacy toggles for the "Manage your reel" panel ─────────────────────
+  // Owner sees the true counts everywhere; everyone else sees the wording
+  // "Liked by others" / "Shared" instead. The frontend enforces the hide by
+  // reading these flags together with a viewer-is-owner check; the backend
+  // strips numeric counts from the payload for non-owner requests so a
+  // hostile client can't sniff them.
+  hideLikeCount:  { type: Boolean, default: false },
+  hideShareCount: { type: Boolean, default: false },
+
+  // ── Archive ──────────────────────────────────────────────────────────────
+  // Archive is a soft-hide separate from "deleted". Archived videos are
+  // visible ONLY to the owner in the profile > Archived list. They must be
+  // filtered out of every public surface (feed, trending, search,
+  // recommendations, user grid). "restore" flips this back to false.
+  isArchived: { type: Boolean, default: false, index: true },
+  archivedAt: { type: Date,    default: null  },
+
+  // ── Location tag (optional geotag from the Edit Reel screen) ─────────────
+  // Free-form string — no reverse geocoding server-side; the client picks a
+  // place label and it is stored verbatim. Capped so an abusive client can't
+  // stuff arbitrary payloads.
+  location: { type: String, trim: true, default: '', maxlength: 120 },
 
   // ── Social Arrays (store userId refs) ────────────────────────────────────
   likes:          [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
@@ -163,6 +187,29 @@ const videoSchema = new mongoose.Schema({
            'news', 'islamic', 'entertainment', 'music', 'other', null],
     default: null,
   },
+  // ── Speech-to-text (Faster-Whisper → DistilBERT) ──────────────────────
+  // Populated asynchronously by runContentAnalysis() after upload. Kept in
+  // its own sub-document so it never collides with the `aiCategory` enum
+  // above (the DistilBERT label set is free-form, e.g. "Professional").
+  //   status: pending → done | empty | failed
+  //   empty  = video had no speech (silent/music-only) — not an error.
+  transcription: {
+    text:             { type: String, default: '' },
+    language:         { type: String, default: '' },
+    category:         { type: String, default: null },  // DistilBERT label
+    confidence:       { type: Number, default: 0, min: 0, max: 1 },
+    processingTimeMs: { type: Number, default: 0 },     // end-to-end pipeline ms
+    audioDuration:    { type: Number, default: 0 },     // seconds of audio
+    engine:           { type: String, default: '' },    // e.g. "faster-whisper:base"
+    status: {
+      type: String,
+      enum: ['pending', 'done', 'empty', 'failed'],
+      default: 'pending',
+    },
+    error:            { type: String, default: '' },
+    transcribedAt:    { type: Date,   default: null },
+  },
+
   informativeScore: { type: Number, default: 0, min: 0, max: 10 },  // 0–10 from AI (or tag-derived fallback)
   tagScore:         { type: Number, default: 0 },                    // weighted tag count
   engagementScore:  { type: Number, default: 0 },                    // computed from views/likes/etc.
@@ -174,6 +221,20 @@ const videoSchema = new mongoose.Schema({
   reports:      [reportSchema],
   reportCount:  { type: Number, default: 0 },
   isReported:   { type: Boolean, default: false },
+
+  // ── Sensitivity (drives the "Hide Sensitive Content" preference) ──────────
+  // Hard PORN/NSFW is rejected at upload and never reaches the DB. This flag
+  // marks content that PASSED moderation but is still borderline — either the
+  // NudeNet frame score landed in a grey band below the reject threshold, or
+  // the tags/title matched a sensitive-topic lexicon (violence, graphic, etc).
+  // Viewers with preferences.content.hideSensitive = true never see these.
+  isSensitive: { type: Boolean, default: false, index: true },
+  moderation: {
+    status:     { type: String, enum: ['SAFE', 'NSFW', 'PORN', null], default: null },
+    confidence: { type: Number, default: 0 },   // 0–1 from the NudeNet worst-frame
+    reason:     { type: String, default: '' },  // why isSensitive was set, if it was
+    checkedAt:  { type: Date,   default: null },
+  },
 
   // ── Content classification (Fact / News / Opinion) ────────────────────────
   // Optional self-declared label that drives the Info panel + source slots.
@@ -241,6 +302,11 @@ videoSchema.index({ tags: 1, createdAt: -1 });
 videoSchema.index({ category: 1, createdAt: -1 });
 videoSchema.index({ viewsCount: -1 });
 videoSchema.index({ likesCount: -1 });
+// isArchived is filtered on nearly every read (feed / trending / search /
+// user grid) so a compound index avoids full-collection scans as the
+// archive count grows.
+videoSchema.index({ status: 1, isArchived: 1, visibility: 1, createdAt: -1 });
+videoSchema.index({ userId: 1, isArchived: 1, createdAt: -1 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INSTANCE HELPERS

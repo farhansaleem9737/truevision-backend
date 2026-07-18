@@ -15,6 +15,12 @@ const userRoutes  = require("./routes/UserRoutes");
 const chatRoutes  = require("./routes/ChatRoutes");
 const aiRoutes       = require("./routes/AIRoutes");
 const activityRoutes = require("./routes/ActivityRoutes");
+const securityRoutes     = require("./routes/SecurityRoutes");
+const notificationRoutes = require("./routes/NotificationRoutes");
+const settingsRoutes     = require("./routes/SettingsRoutes");
+const appRoutes          = require("./routes/AppRoutes");
+const legalRoutes        = require("./routes/LegalRoutes");
+const supportRoutes      = require("./routes/SupportRoutes");
 const { initSocket } = require("./socket");
 
 const app    = express();
@@ -90,6 +96,17 @@ app.use("/api/users",  rateLimit(100, 60 * 1000,       'user'),   userRoutes);
 app.use("/api/chats",  rateLimit(200, 60 * 1000,       'chat'),   chatRoutes);
 app.use("/api/ai",       rateLimit(60,  60 * 1000,     'ai'),       aiRoutes);
 app.use("/api/activity", rateLimit(200, 60 * 1000,     'activity'), activityRoutes);
+// Security endpoints get a tight mount-level limit; OTP routes add their own
+// stricter per-route limits inside SecurityRoutes.
+app.use("/api/security",      rateLimit(60,  15 * 60 * 1000, 'security'),     securityRoutes);
+app.use("/api/notifications", rateLimit(120, 60 * 1000,      'notification'), notificationRoutes);
+app.use("/api/settings",      rateLimit(60,  60 * 1000,      'settings'),     settingsRoutes);
+// Public app-info + legal endpoints (no auth). Generous limit — polled by the
+// About screen and update checker.
+app.use("/api/app",           rateLimit(120, 60 * 1000,      'app'),          appRoutes);
+app.use("/api/legal",         rateLimit(120, 60 * 1000,      'legal'),        legalRoutes);
+// Support: FAQs are public; ticket writes are tighter to deter spam.
+app.use("/api/support",       rateLimit(60,  60 * 1000,      'support'),      supportRoutes);
 
 // Health check
 app.get("/health", (req, res) => {
@@ -120,6 +137,8 @@ redis.boot().then(() => {
   // Counter-buffer flush loop — writes accumulated view/share deltas to
   // Mongo every 30 s. No-op when Redis is down.
   try { require('./services/counterBuffer').start(); } catch (_) { /* optional */ }
+  // Weekly creator-report emails (opt-in via notifications.emailWeekly).
+  try { require('./services/weeklyReports').start(); } catch (_) { /* optional */ }
 });
 
 // ── Initialize Socket.IO ─────────────────────────────────────────────────────

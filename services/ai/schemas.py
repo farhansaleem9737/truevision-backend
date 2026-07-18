@@ -83,6 +83,33 @@ class ModerateResponse(BaseModel):
     fallback: bool = False
 
 
+# ── /transcribe ──────────────────────────────────────────────────────────────
+
+class TranscriptSegment(BaseModel):
+    start: float
+    end: float
+    text: str
+
+
+class TranscribeResponse(BaseModel):
+    transcript: str
+    # None when the transcript is empty OR when the classifier is unavailable
+    # (see classifier_error) — the transcript is still returned either way.
+    category: Optional[str] = None
+    confidence: float = 0.0
+    # Set when Whisper succeeded but DistilBERT could not classify (e.g. the
+    # trained weights are missing). Transcription is NOT failed in that case.
+    classifier_error: Optional[str] = None
+    all_scores: Dict[str, float] = {}
+    language: str = ""
+    language_probability: float = 0.0
+    duration: float = 0.0               # audio length in seconds
+    processing_time: float = 0.0        # end-to-end seconds
+    empty: bool = False                 # True when no speech was detected
+    video_id: Optional[str] = None
+    segments: List[TranscriptSegment] = []
+
+
 # ── /chatbot ─────────────────────────────────────────────────────────────────
 
 class ChatTurn(BaseModel):

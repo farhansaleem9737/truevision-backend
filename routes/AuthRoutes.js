@@ -12,6 +12,11 @@ router.post('/resend-otp', authController.resendOTP);
 router.post('/login', authController.login);
 router.post('/google', authController.googleSignIn);
 
+// 2FA sign-in completion — authenticated by the short-lived pendingToken
+// issued by /login when the account has twoFactorEnabled.
+router.post('/2fa-verify', authController.twoFactorVerify);
+router.post('/2fa-resend', authController.twoFactorResend);
+
 // SMTP diagnostic — leave mounted while you're stabilising email transport;
 // remove or guard with an admin role before going to production.
 router.get('/test-email', authController.testEmail);

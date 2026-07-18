@@ -22,6 +22,7 @@ const User       = require('./models/User');
 const Chat       = require('./models/Chat');
 const Message    = require('./models/Message');
 const presence   = require('./services/presenceStore');
+const privacy    = require('./services/privacy');
 
 // Legacy alias for old callers.
 const onlineUsers = {
@@ -43,6 +44,29 @@ const emitToUser = async (userId, event, data) => {
 const getIO = () => io;
 const presenceIsOnline = (uid) => presence.isOnline(uid);
 
+/**
+ * Force every live socket for a user to disconnect.
+ *
+ * Called after a password change or "log out from all devices". The handshake
+ * check below stops REVOKED tokens from opening NEW sockets, but a socket
+ * that was already connected stays connected — this severs it immediately so
+ * revocation is instant on the realtime surface too. The client's reconnect
+ * attempt then fails the handshake and the app routes to login.
+ */
+const disconnectUser = async (userId, reason = 'session-revoked') => {
+  if (!io) return;
+  try {
+    const sockets = await presence.socketsFor(String(userId));
+    sockets.forEach((sid) => {
+      const s = io.sockets.sockets.get(sid);
+      if (s) {
+        s.emit('sessionRevoked', { reason });
+        s.disconnect(true);
+      }
+    });
+  } catch (_) { /* best-effort */ }
+};
+
 // ── Init ────────────────────────────────────────────────────────────────────
 
 const initSocket = (httpServer) => {
@@ -54,16 +78,44 @@ const initSocket = (httpServer) => {
   });
 
   // ── Auth middleware — verify JWT before allowing connection ───────────
+  //
+  // This MUST enforce exactly the same rules as middleware/Auth.js protect().
+  // The realtime surface (send message, read chats, presence) is every bit as
+  // sensitive as the REST surface, so a token rejected there must be rejected
+  // here too. Three checks, in order:
+  //   1. purpose === '2fa-pending' → the password was right but the OTP was
+  //      never entered. Not a session token. Reject.
+  //   2. Redis revocation list      → explicit per-token kill (logout).
+  //   3. tokenInvalidBefore cutoff  → global kill (change password / logout-all).
   io.use(async (socket, next) => {
     try {
       const token = socket.handshake.auth?.token;
       if (!token) return next(new Error('Authentication required'));
 
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      const user    = await User.findById(decoded.userId)
-        .select('fullName username profileImage isVerified')
+
+      // 1. Pending 2FA tokens only authorize POST /auth/2fa-verify.
+      if (decoded.purpose === '2fa-pending') {
+        return next(new Error('Invalid token'));
+      }
+
+      // 2. Explicitly revoked (logout) — same Redis list protect() consults.
+      const { isTokenRevoked } = require('./middleware/Auth');
+      if (await isTokenRevoked(token)) {
+        return next(new Error('Session ended'));
+      }
+
+      const user = await User.findById(decoded.userId)
+        .select('fullName username profileImage isVerified tokenInvalidBefore')
         .lean();
       if (!user) return next(new Error('User not found'));
+
+      // 3. Global cutoff — password change / log-out-all revokes every token
+      //    minted before that moment.
+      if (user.tokenInvalidBefore &&
+          decoded.iat * 1000 < new Date(user.tokenInvalidBefore).getTime()) {
+        return next(new Error('Session expired'));
+      }
 
       socket.userId   = user._id.toString();
       socket.userData = user;
@@ -118,6 +170,20 @@ const initSocket = (httpServer) => {
         if (!chat) return ack?.({ success: false, message: 'Chat not found' });
         if (!chat.members.some(m => m.toString() === uid)) {
           return ack?.({ success: false, message: 'Not a member' });
+        }
+
+        // Messaging policy — mirrors the REST path: re-checked on EVERY
+        // 1-on-1 send because settings (whoCanMessage, blocks) can change
+        // after the chat exists. Groups skip it.
+        if (chat.type === 'single') {
+          const otherId = controller._otherMembers(chat, uid)[0];
+          const other = otherId
+            ? await User.findById(otherId).select('followers following preferences blockedUsers')
+            : null;
+          const verdict = await privacy.canMessage(uid, other);
+          if (!verdict.allowed) {
+            return ack?.({ success: false, code: verdict.code, message: verdict.message });
+          }
         }
 
         const message = await controller._createMessageDoc({ chat, senderId: uid, body: data });
@@ -213,6 +279,16 @@ const initSocket = (httpServer) => {
 // partner instead of one per chat.
 async function broadcastOnlineStatus(userId, isOnline, lastSeen = null) {
   try {
+    // Presence privacy: users hiding their online status never appear online.
+    // Their offline event still fans out (so partners see them drop off) but
+    // carries no last-seen timestamp. DB writes of isOnline/lastSeen are
+    // untouched — only the outbound surface is gated.
+    const u = await User.findById(userId).select('preferences').lean();
+    if (!privacy.presenceVisible(u)) {
+      if (isOnline) return;
+      lastSeen = null;
+    }
+
     const chats = await Chat.find({ members: userId }).select('members').lean();
     const partners = new Set();
     chats.forEach((c) => c.members.forEach((m) => {
@@ -269,5 +345,7 @@ module.exports = {
   getIO,
   emitToUser,
   presenceIsOnline,
+  disconnectUser,        // SecurityController severs live sockets on revocation
+  broadcastOnlineStatus, // UserController re-broadcasts when hideOnlineStatus flips
   onlineUsers, // legacy
 };

@@ -1,10 +1,11 @@
 // Backend/controllers/ActivityController.js
 //
 // "My Activity" backend. Centralises:
-//   • Watch History       — recordWatch / listWatch / deleteWatch / clearWatch
 //   • Viewed Profiles     — recordProfileView / listProfileViews / delete / clear
 //   • Shared Videos       — recordShare / listShares / delete / clear
 //   • Search History      — recordSearch / listSearches / delete / clear
+//   • Comments History    — listMyComments (read-only; comments are managed
+//                           through the CommentController CRUD endpoints)
 //   • Clear all activity  — clearAll
 //
 // Liked + Saved videos already live in VideoController (toggleLike, toggleSave,
@@ -14,10 +15,11 @@
 // All endpoints assume `req.user.id` is set by the `protect` middleware.
 
 const mongoose       = require('mongoose');
-const WatchHistory   = require('../models/WatchHistory');
 const ViewedProfile  = require('../models/ViewedProfile');
 const SharedVideo    = require('../models/SharedVideo');
 const SearchHistory  = require('../models/SearchHistory');
+const Comment        = require('../models/Comment');
+const Video          = require('../models/Video');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 const ok   = (res, data, statusCode = 200) =>
@@ -33,145 +35,6 @@ const pageParams = (req, maxLimit = 50) => {
 };
 
 const isObjectId = (s) => mongoose.Types.ObjectId.isValid(s);
-
-// ═════════════════════════════════════════════════════════════════════════════
-// WATCH HISTORY
-// ═════════════════════════════════════════════════════════════════════════════
-
-// POST /api/activity/watch-history
-//   Body: { videoId, lastPlaybackPosition?, watchDuration?, completionPercentage?, videoDuration? }
-// Upserts the row so re-watching bumps `watchedAt` without duplicating.
-//
-// `completionPercentage` is computed server-side if not sent: when
-// `videoDuration` is provided, percentage = watchDuration / videoDuration.
-// This lets the caller piggyback on /videos/:id/view without doing math.
-exports.recordWatch = async (req, res) => {
-  try {
-    const {
-      videoId,
-      // Accept both new + legacy field names so older clients still work.
-      lastPlaybackPosition,
-      lastPosition,
-      watchDuration       = 0,
-      completionPercentage,
-      videoDuration,
-    } = req.body;
-    if (!isObjectId(videoId)) return fail(res, 'videoId is required');
-
-    const position = Math.max(0, Number(lastPlaybackPosition ?? lastPosition) || 0);
-    const duration = Math.max(0, Number(watchDuration) || 0);
-
-    // Compute completion from duration if not explicitly provided.
-    let completion = Number(completionPercentage);
-    if (!Number.isFinite(completion) && Number(videoDuration) > 0) {
-      completion = (duration / Number(videoDuration)) * 100;
-    }
-    if (!Number.isFinite(completion)) completion = 0;
-    completion = Math.max(0, Math.min(100, completion));
-
-    await WatchHistory.findOneAndUpdate(
-      { userId: req.user.id, videoId },
-      {
-        $set: {
-          watchedAt:            new Date(),
-          lastPlaybackPosition: position,
-          watchDuration:        duration,
-          completionPercentage: completion,
-        },
-        $setOnInsert: { userId: req.user.id, videoId },
-      },
-      { upsert: true, new: true },
-    );
-    return ok(res, { message: 'recorded' });
-  } catch (err) {
-    console.error('recordWatch error:', err);
-    return fail(res, 'Failed to record watch', 500);
-  }
-};
-
-// POST /api/activity/watch-history/bulk-delete
-//   Body: { ids: [<watchHistoryRowId>, ...] }
-// Bulk removal for the multi-select toolbar on the Watch History screen.
-exports.bulkDeleteWatch = async (req, res) => {
-  try {
-    const { ids } = req.body || {};
-    if (!Array.isArray(ids) || !ids.length) {
-      return fail(res, 'ids[] is required');
-    }
-    const validIds = ids.filter(isObjectId);
-    if (!validIds.length) return fail(res, 'no valid ids');
-    const r = await WatchHistory.deleteMany({
-      userId: req.user.id,
-      _id: { $in: validIds },
-    });
-    return ok(res, { deleted: r.deletedCount });
-  } catch (err) {
-    console.error('bulkDeleteWatch error:', err);
-    return fail(res, 'Bulk delete failed', 500);
-  }
-};
-
-// GET /api/activity/watch-history?page=1&limit=20
-exports.listWatch = async (req, res) => {
-  try {
-    const { page, limit, skip } = pageParams(req);
-    const filter = { userId: req.user.id };
-
-    const [rows, total] = await Promise.all([
-      WatchHistory.find(filter)
-        .sort({ watchedAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .populate('videoId', 'title thumbnailUrl videoUrl duration userId category')
-        .lean(),
-      WatchHistory.countDocuments(filter),
-    ]);
-
-    // Drop rows whose video was deleted (populate returns null in that case).
-    const items = rows
-      .filter((r) => r.videoId)
-      .map((r) => ({
-        _id:                  r._id,
-        video:                r.videoId,
-        watchedAt:            r.watchedAt,
-        lastPlaybackPosition: r.lastPlaybackPosition || 0,
-        watchDuration:        r.watchDuration        || 0,
-        completionPercentage: r.completionPercentage || 0,
-      }));
-
-    return ok(res, {
-      items,
-      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
-    });
-  } catch (err) {
-    console.error('listWatch error:', err);
-    return fail(res, 'Failed to fetch watch history', 500);
-  }
-};
-
-// DELETE /api/activity/watch-history/:videoId — remove one entry
-exports.deleteWatch = async (req, res) => {
-  try {
-    const { videoId } = req.params;
-    if (!isObjectId(videoId)) return fail(res, 'invalid videoId');
-    const r = await WatchHistory.deleteOne({ userId: req.user.id, videoId });
-    return ok(res, { deleted: r.deletedCount });
-  } catch (err) {
-    console.error('deleteWatch error:', err);
-    return fail(res, 'Delete failed', 500);
-  }
-};
-
-// DELETE /api/activity/watch-history — clear everything
-exports.clearWatch = async (req, res) => {
-  try {
-    const r = await WatchHistory.deleteMany({ userId: req.user.id });
-    return ok(res, { deleted: r.deletedCount });
-  } catch (err) {
-    console.error('clearWatch error:', err);
-    return fail(res, 'Clear failed', 500);
-  }
-};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // VIEWED PROFILES
@@ -290,17 +153,22 @@ exports.listShares = async (req, res) => {
         .skip(skip)
         .limit(limit)
         .populate('videoId', 'title thumbnailUrl videoUrl duration userId category')
+        .populate('toUserId', 'username fullName profileImage')
         .lean(),
       SharedVideo.countDocuments(filter),
     ]);
 
+    // `recipient` + `method` are the preferred keys; `platform` is kept for
+    // older clients that still read it.
     const items = rows
       .filter((r) => r.videoId)
       .map((r) => ({
-        _id:      r._id,
-        video:    r.videoId,
-        platform: r.platform,
-        sharedAt: r.sharedAt,
+        _id:       r._id,
+        video:     r.videoId,
+        platform:  r.platform,
+        method:    r.platform,
+        recipient: r.toUserId || null,
+        sharedAt:  r.sharedAt,
       }));
 
     return ok(res, {
@@ -332,6 +200,63 @@ exports.clearShares = async (req, res) => {
   } catch (err) {
     console.error('clearShares error:', err);
     return fail(res, 'Clear failed', 500);
+  }
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+// COMMENTS HISTORY
+// ═════════════════════════════════════════════════════════════════════════════
+
+// GET /api/activity/comments?page=1&limit=20
+// Every comment the user has written, newest first. Rows whose video was
+// deleted are KEPT with video:null — the client renders a "video removed"
+// card instead of silently dropping the user's own words. Soft-deleted
+// (hidden) comments are excluded: they no longer exist as far as the user
+// is concerned.
+exports.listMyComments = async (req, res) => {
+  try {
+    const { page, limit, skip } = pageParams(req);
+    const filter = { userId: req.user.id, isHidden: { $ne: true } };
+
+    const [rows, total] = await Promise.all([
+      Comment.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Comment.countDocuments(filter),
+    ]);
+
+    // Batch-fetch the videos instead of populate: populate nulls videoId for
+    // orphan rows, and the client needs the RAW id to edit/delete a comment
+    // even after its video is gone.
+    const videoIds = [...new Set(rows.map((c) => String(c.videoId)))];
+    const vids = await Video.find({ _id: { $in: videoIds } })
+      .select('title thumbnailUrl')
+      .lean();
+    const vidMap = new Map(vids.map((v) => [String(v._id), v]));
+
+    const items = rows.map((c) => {
+      const v = vidMap.get(String(c.videoId));
+      return {
+        _id:          c._id,
+        text:         c.text,
+        createdAt:    c.createdAt,
+        isEdited:     !!c.isEdited,
+        likesCount:   c.likesCount   || c.likes?.length   || 0,
+        repliesCount: c.repliesCount || c.replies?.length || 0,
+        videoId:      String(c.videoId),
+        video: v ? { _id: v._id, title: v.title, thumbnailUrl: v.thumbnailUrl } : null,
+      };
+    });
+
+    return ok(res, {
+      items,
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+    });
+  } catch (err) {
+    console.error('listMyComments error:', err);
+    return fail(res, 'Failed to fetch comments history', 500);
   }
 };
 
@@ -408,15 +333,13 @@ exports.clearSearches = async (req, res) => {
 exports.clearAll = async (req, res) => {
   try {
     const uid = req.user.id;
-    const [w, p, s, q] = await Promise.all([
-      WatchHistory.deleteMany({ userId: uid }),
+    const [p, s, q] = await Promise.all([
       ViewedProfile.deleteMany({ viewerId: uid }),
       SharedVideo.deleteMany({ userId: uid }),
       SearchHistory.deleteMany({ userId: uid }),
     ]);
     return ok(res, {
       deleted: {
-        watchHistory:   w.deletedCount,
         viewedProfiles: p.deletedCount,
         sharedVideos:   s.deletedCount,
         searchHistory:  q.deletedCount,

@@ -1,12 +1,34 @@
 // Backend/controllers/CommentController.js
 const Comment = require('../models/Comment');
 const Video   = require('../models/Video');
+const User    = require('../models/User');
+const privacy = require('../services/privacy');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 const ok   = (res, data, statusCode = 200) => res.status(statusCode).json({ success: true,  ...data });
 const fail = (res, message, statusCode = 400) => res.status(statusCode).json({ success: false, message });
+
+// Privacy gate shared by addComment + addReply. Checks, in order:
+//   1. the owner's whoCanComment policy (+ blocks, via privacy.canComment);
+//   2. account-level privacy — a private account only accepts comments from
+//      approved followers, regardless of whoCanComment.
+// Returns null when allowed, otherwise the 403 body to send.
+const commentGate = async (actorId, ownerUserId) => {
+  const owner = await User.findById(ownerUserId)
+    .select('followers following preferences blockedUsers')
+    .lean();
+
+  const verdict = await privacy.canComment(actorId, owner);
+  if (!verdict.allowed) {
+    return { success: false, code: verdict.code, message: verdict.message };
+  }
+  if (!privacy.canViewContentOf(actorId, owner)) {
+    return { success: false, code: 'ACCOUNT_PRIVATE', message: 'This account is private.' };
+  }
+  return null;
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET COMMENTS FOR A VIDEO
@@ -20,6 +42,30 @@ exports.getComments = async (req, res) => {
     const sort  = req.query.sort === 'top'
       ? { isPinned: -1, likesCount: -1 }
       : { isPinned: -1, createdAt:  -1 };
+
+    // Read-side privacy: comments are only as visible as the video itself.
+    const video = await Video.findById(req.params.id)
+      .select('userId status visibility isArchived')
+      .lean();
+    if (!video || video.status === 'deleted') return fail(res, 'Video not found', 404);
+
+    const viewerIsOwner = String(req.user?.id || '') === String(video.userId);
+    if (!viewerIsOwner) {
+      if (video.isArchived) return fail(res, 'Video not found', 404);
+      if (req.user?.id && await privacy.isBlockedBetween(req.user.id, video.userId)) {
+        return fail(res, 'Video not found', 404);
+      }
+      if (video.visibility === 'private') {
+        return res.status(403).json({ success: false, code: 'VIDEO_PRIVATE', message: 'This video is private.' });
+      }
+      const owner = await User.findById(video.userId).select('followers preferences').lean();
+      if (video.visibility === 'followers' && !privacy.isFollower(req.user?.id || null, owner)) {
+        return res.status(403).json({ success: false, code: 'VIDEO_PRIVATE', message: 'This video is only visible to followers.' });
+      }
+      if (!privacy.canViewContentOf(req.user?.id || null, owner)) {
+        return res.status(403).json({ success: false, code: 'ACCOUNT_PRIVATE', message: 'This account is private.' });
+      }
+    }
 
     const filter = { videoId: req.params.id, isHidden: false };
 
@@ -55,6 +101,10 @@ exports.addComment = async (req, res) => {
     if (!video || video.status === 'deleted') return fail(res, 'Video not found', 404);
     if (!video.allowComments) return fail(res, 'Comments are disabled for this video', 403);
 
+    // Privacy: owner's whoCanComment policy + blocks + private-account gate.
+    const denied = await commentGate(req.user.id, video.userId);
+    if (denied) return res.status(403).json(denied);
+
     const { text } = req.body;
     if (!text?.trim()) return fail(res, 'Comment text is required');
 
@@ -66,6 +116,38 @@ exports.addComment = async (req, res) => {
 
     // Increment video comment counter
     await Video.findByIdAndUpdate(req.params.id, { $inc: { commentsCount: 1 } });
+
+    // ── Notifications (fire-and-forget, pref-gated in the center) ─────────
+    const notificationCenter = require('../services/notificationCenter');
+    const preview = text.trim().slice(0, 120);
+
+    // 1. Video owner — "comments" kind (self-comments filtered by the center).
+    notificationCenter.notify(video.userId, 'comments', {
+      title: `@${req.user.username} commented on your video`,
+      body:  preview,
+      fromUserId: req.user.id,
+      data: { videoId: String(video._id), commentId: String(comment._id), type: 'comment' },
+    }).catch(() => {});
+
+    // 2. @mentions — every distinct @username in the text that maps to a
+    //    real account gets a "mentions" notification (owner excluded — they
+    //    already got the comment one; the center also drops self-mentions).
+    const mentioned = [...new Set((text.match(/@([a-z0-9_]{3,30})/gi) || [])
+      .map((m) => m.slice(1).toLowerCase()))].slice(0, 10);
+    if (mentioned.length) {
+      User.find({ username: { $in: mentioned } }).select('_id').lean()
+        .then((users) => Promise.all(
+          users
+            .filter((u) => !u._id.equals(video.userId))
+            .map((u) => notificationCenter.notify(u._id, 'mentions', {
+              title: `@${req.user.username} mentioned you in a comment`,
+              body:  preview,
+              fromUserId: req.user.id,
+              data: { videoId: String(video._id), commentId: String(comment._id), type: 'mention' },
+            })),
+        ))
+        .catch(() => {});
+    }
 
     await comment.populate('userId', 'username fullName profileImage');
     return ok(res, { message: 'Comment added', comment }, 201);
@@ -84,6 +166,17 @@ exports.editComment = async (req, res) => {
   try {
     const comment = await Comment.findById(req.params.commentId);
     if (!comment || comment.isHidden) return fail(res, 'Comment not found', 404);
+
+    // Debug breadcrumb — dev only. Makes it obvious when a comment owner
+    // check fails whether it was really a different user or an ObjectId-vs-
+    // string mismatch. Paired with the [auth] log in Auth.js so both sides
+    // of the equality are visible in the same terminal.
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(
+        `[editComment] commentId=${comment._id} owner=${comment.userId} caller=${req.user._id} match=${comment.userId.equals(req.user.id)}`,
+      );
+    }
+
     if (!comment.userId.equals(req.user.id)) return fail(res, 'Unauthorized', 403);
 
     const { text } = req.body;
@@ -141,6 +234,13 @@ exports.toggleCommentLike = async (req, res) => {
   try {
     const comment = await Comment.findById(req.params.commentId);
     if (!comment || comment.isHidden) return fail(res, 'Comment not found', 404);
+
+    // Blocked pairs can't interact with content on each other's videos.
+    const video = await Video.findById(comment.videoId).select('userId');
+    if (!video) return fail(res, 'Video not found', 404);
+    if (await privacy.isBlockedBetween(req.user.id, video.userId)) {
+      return fail(res, 'You cannot interact with this content.', 403);
+    }
 
     const uid   = req.user.id;
     const liked = comment.isLikedBy(uid);
@@ -204,6 +304,15 @@ exports.addReply = async (req, res) => {
   try {
     const comment = await Comment.findById(req.params.commentId);
     if (!comment || comment.isHidden) return fail(res, 'Comment not found', 404);
+
+    // Same enforcement as addComment — a reply is still a comment on the
+    // video, so the owner's comment policy + privacy settings apply.
+    const video = await Video.findById(req.params.id).select('userId status allowComments');
+    if (!video || video.status === 'deleted') return fail(res, 'Video not found', 404);
+    if (!video.allowComments) return fail(res, 'Comments are disabled for this video', 403);
+
+    const denied = await commentGate(req.user.id, video.userId);
+    if (denied) return res.status(403).json(denied);
 
     const { text } = req.body;
     if (!text?.trim()) return fail(res, 'Reply text is required');
@@ -289,6 +398,13 @@ exports.toggleReplyLike = async (req, res) => {
   try {
     const comment = await Comment.findById(req.params.commentId);
     if (!comment || comment.isHidden) return fail(res, 'Comment not found', 404);
+
+    // Blocked pairs can't interact with content on each other's videos.
+    const video = await Video.findById(comment.videoId).select('userId');
+    if (!video) return fail(res, 'Video not found', 404);
+    if (await privacy.isBlockedBetween(req.user.id, video.userId)) {
+      return fail(res, 'You cannot interact with this content.', 403);
+    }
 
     const reply = comment.replies.id(req.params.replyId);
     if (!reply) return fail(res, 'Reply not found', 404);

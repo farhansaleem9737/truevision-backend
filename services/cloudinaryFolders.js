@@ -51,6 +51,9 @@ exports.foldersFor = (userId) => {
     // ── Supporting-evidence / news files (existing feature) ────────────
     attachments:  perUser('attachments'),
 
+    // ── Help & Support (contact attachments, bug-report media/logs) ────
+    support:       perUser('support'),
+
     // ── App-wide assets (managed by admins, not per-user) ──────────────
     notifications: appWide('notifications'),
     banners:       appWide('banners'),
@@ -79,6 +82,10 @@ exports.resolveKind = (kind, userId) => {
     case 'story-video':   return { folder: F.storyVideos,   resourceType: 'video' };
     case 'attachment':    return { folder: F.attachments,   resourceType: 'raw'   };
     case 'attachment-image': return { folder: F.attachments, resourceType: 'image' };
+    // ── Help & Support ──────────────────────────────────────────────────
+    case 'support-image': return { folder: F.support,        resourceType: 'image' };
+    case 'support-video': return { folder: F.support,        resourceType: 'video' };
+    case 'support-doc':   return { folder: F.support,        resourceType: 'raw'   };
     default: return null;
   }
 };

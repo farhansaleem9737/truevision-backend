@@ -75,6 +75,22 @@ def load() -> None:
                 "TRUEVISION_MODEL_DIR in your .env."
             )
 
+        # The directory can exist while holding only config/tokenizer files —
+        # that's a trained model whose *weights* were never exported. Detect it
+        # here so callers get a descriptive 503 (FileNotFoundError is mapped to
+        # 503 upstream) instead of an opaque OSError 500 from from_pretrained().
+        if not settings.model_weights_exist:
+            raise FileNotFoundError(
+                f"DistilBERT weights missing in {settings.model_dir}. Found no "
+                "model.safetensors / pytorch_model.bin — only config/tokenizer "
+                "files are present, so the trained weights were never exported. "
+                "Re-export them from your training notebook with "
+                "`model.save_pretrained('truevision_model')` and copy "
+                "model.safetensors (plus special_tokens_map.json and vocab.txt) "
+                "into this folder. Classification stays disabled until then; "
+                "transcription is unaffected."
+            )
+
         # Imported lazily so that simply importing this module (e.g. for
         # tests) doesn't drag in PyTorch.
         import torch
@@ -101,6 +117,12 @@ def load() -> None:
             )
 
         logger.info("DistilBERT ready on %s | labels=%s", _device, _id2label)
+
+
+def is_ready() -> bool:
+    """True once the model is resident in memory. Read-only probe used by
+    /health — does not trigger a load."""
+    return _model is not None
 
 
 def predict(text: str) -> Dict:

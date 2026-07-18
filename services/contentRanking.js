@@ -174,12 +174,154 @@ const scoreVideo = (video, opts = {}) => {
   return { tagScore, engagementScore, informativeScore, rankingScore };
 };
 
+// ═════════════════════════════════════════════════════════════════════════════
+// INTERESTED-TOPICS LEXICON + PER-USER PERSONALIZATION
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// The Content-Preferences screen lets a user pick from a fixed topic list.
+// Each topic maps to (a) the Video.category values that represent it and
+// (b) a keyword set matched against tags + title + description. A video
+// "matches" a topic if either signal fires. This powers the personalized
+// feed's topic boost — no AI service required.
+
+// Canonical topics — MUST stay in sync with SettingsController.AVAILABLE_TOPICS
+// and the client's InterestedTopicsScreen. Keys are the stored topic strings
+// (lower-cased on compare).
+const TOPIC_SIGNALS = {
+  Technology:   { categories: ['tech'],        keywords: ['tech', 'technology', 'gadget', 'software', 'hardware', 'startup', 'app', 'computer', 'innovation'] },
+  Programming:  { categories: ['programming', 'tech'], keywords: ['programming', 'coding', 'developer', 'javascript', 'python', 'react', 'nodejs', 'typescript', 'webdev', 'backend', 'frontend', 'algorithm', 'code'] },
+  AI:           { categories: ['tech', 'programming'], keywords: ['ai', 'artificial intelligence', 'machine learning', 'ml', 'deep learning', 'neural', 'llm', 'chatgpt', 'data science', 'datascience'] },
+  Education:    { categories: ['education'],    keywords: ['education', 'learn', 'tutorial', 'course', 'lesson', 'lecture', 'study', 'explained', 'how-to', 'howto', 'guide'] },
+  Business:     { categories: ['business'],     keywords: ['business', 'startup', 'entrepreneur', 'marketing', 'sales', 'management', 'leadership', 'company'] },
+  Science:      { categories: ['education'],    keywords: ['science', 'physics', 'chemistry', 'biology', 'space', 'astronomy', 'experiment', 'research', 'scientific'] },
+  Finance:      { categories: ['finance'],      keywords: ['finance', 'investing', 'stocks', 'crypto', 'money', 'economics', 'trading', 'wealth', 'budget', 'savings'] },
+  Islamic:      { categories: ['islamic'],      keywords: ['islamic', 'islam', 'quran', 'hadith', 'fiqh', 'seerah', 'muslim', 'deen', 'sunnah', 'dua'] },
+  History:      { categories: ['education'],    keywords: ['history', 'historical', 'ancient', 'civilization', 'war', 'empire', 'heritage', 'archaeology'] },
+  Health:       { categories: ['education'],    keywords: ['health', 'fitness', 'nutrition', 'medical', 'wellness', 'mental health', 'workout', 'diet', 'exercise'] },
+  Productivity: { categories: ['productivity'], keywords: ['productivity', 'habits', 'time management', 'focus', 'discipline', 'organization', 'workflow', 'efficiency'] },
+  News:         { categories: ['news'],         keywords: ['news', 'breaking', 'current affairs', 'politics', 'world', 'update', 'report', 'journalism'] },
+  Travel:       { categories: ['travel'],       keywords: ['travel', 'trip', 'tourism', 'destination', 'adventure', 'journey', 'explore', 'vacation'] },
+  Nature:       { categories: ['travel', 'education'], keywords: ['nature', 'wildlife', 'animals', 'environment', 'ocean', 'forest', 'mountains', 'planet', 'earth'] },
+  Sports:       { categories: ['sports'],       keywords: ['sports', 'football', 'cricket', 'basketball', 'soccer', 'athlete', 'game', 'match', 'training'] },
+  Engineering:  { categories: ['tech', 'education'], keywords: ['engineering', 'mechanical', 'electrical', 'civil', 'robotics', 'design', 'build', 'construction'] },
+  Mathematics:  { categories: ['education'],    keywords: ['math', 'mathematics', 'algebra', 'calculus', 'geometry', 'statistics', 'numbers', 'equation'] },
+  Languages:    { categories: ['education'],    keywords: ['language', 'english', 'arabic', 'spanish', 'french', 'grammar', 'vocabulary', 'linguistics', 'translation'] },
+};
+
+const AVAILABLE_TOPICS = Object.keys(TOPIC_SIGNALS);
+
+// Pre-lower-cased lookup so a stored topic string resolves regardless of case.
+const TOPIC_BY_LOWER = new Map(
+  AVAILABLE_TOPICS.map((t) => [t.toLowerCase(), TOPIC_SIGNALS[t]]),
+);
+
+/**
+ * Does this video match any of the viewer's interested topics?
+ * Returns the number of distinct topics matched (0 = no match).
+ */
+const topicMatchCount = (video, interestedTopics = []) => {
+  if (!interestedTopics?.length) return 0;
+  const category = norm(video.category);
+  const text = `${norm(video.title)} ${norm(video.description)} ${(video.tags || []).map(norm).join(' ')}`;
+  let matches = 0;
+  for (const topic of interestedTopics) {
+    const sig = TOPIC_BY_LOWER.get(norm(topic));
+    if (!sig) continue;
+    const catHit = sig.categories.includes(category);
+    const kwHit  = sig.keywords.some((kw) => text.includes(kw));
+    if (catHit || kwHit) matches += 1;
+  }
+  return matches;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SENSITIVITY DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
+// Hard NSFW/PORN is already blocked at upload. This flags borderline-but-
+// allowed content for the "Hide Sensitive Content" filter:
+//   1. Moderation confidence in a grey band (passed, but not clearly safe).
+//   2. Tags/title/description hit a sensitive-topic lexicon.
+const SENSITIVE_KEYWORDS = new Set([
+  'violence', 'violent', 'gore', 'gory', 'graphic', 'blood', 'bloody', 'brutal',
+  'disturbing', 'nsfw', 'gambling', 'betting', 'drugs', 'weapon', 'gun', 'knife',
+  'fight', 'injury', 'accident', 'death', 'kill', 'horror', 'scary', 'shocking',
+]);
+
+// NudeNet worst-frame score band that "passed" (below the reject threshold,
+// default 0.30) but is still non-trivial. Anything in [0.12, threshold) is
+// borderline. Reject threshold itself lives in nsfwModeration.
+const SENSITIVE_CONFIDENCE_FLOOR = 0.12;
+
+/**
+ * Decide whether a video is sensitive-but-allowed.
+ * @param {object} video      { tags, title, description }
+ * @param {object} moderation { status, confidence } from nsfwModeration
+ * @param {number} rejectThreshold  the NSFW reject cutoff (frame ≥ this was blocked)
+ * @returns {{ isSensitive: boolean, reason: string }}
+ */
+const computeSensitivity = (video = {}, moderation = {}, rejectThreshold = 0.30) => {
+  const conf = Number(moderation.confidence) || 0;
+  if (conf >= SENSITIVE_CONFIDENCE_FLOOR && conf < rejectThreshold) {
+    return { isSensitive: true, reason: `borderline-moderation:${conf.toFixed(2)}` };
+  }
+  const text = `${norm(video.title)} ${norm(video.description)} ${(video.tags || []).map(norm).join(' ')}`;
+  for (const kw of SENSITIVE_KEYWORDS) {
+    if (text.includes(kw)) return { isSensitive: true, reason: `keyword:${kw}` };
+  }
+  return { isSensitive: false, reason: '' };
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PER-USER PERSONALIZATION SCORE
+// ─────────────────────────────────────────────────────────────────────────────
+// Re-ranks a candidate video for ONE viewer. Combines the video's global
+// quality (rankingScore, which already encodes engagement/watch/likes) with
+// per-user affinity signals:
+//   • topic match   — video matches an interested topic          (strong)
+//   • following     — video is from a creator the viewer follows (strong)
+//   • liked-author  — bonus reserved for future collaborative data
+//   • recency       — mild freshness nudge so the feed stays live
+//
+// Returns a single sortable number. Higher = show sooner.
+const personalizeScore = (video, ctx = {}) => {
+  const {
+    interestedTopics = [],
+    followingSet = new Set(),
+    now = Date.now(),
+  } = ctx;
+
+  // Base: global quality on a 0–10 scale.
+  const base = Math.max(0, Math.min(10, video.rankingScore || 0));
+
+  // Topic affinity — each matched topic adds a meaningful boost, capped.
+  const topicHits = topicMatchCount(video, interestedTopics);
+  const topicBoost = Math.min(topicHits, 3) * 2.5; // up to +7.5
+
+  // Following affinity — content from people you follow is highly relevant.
+  const ownerId = String(video.userId?._id || video.userId || '');
+  const followBoost = followingSet.has(ownerId) ? 3.0 : 0;
+
+  // Recency nudge — decays over ~14 days, worth up to +1.5.
+  const ageMs = now - new Date(video.createdAt || now).getTime();
+  const ageDays = ageMs / (1000 * 60 * 60 * 24);
+  const recencyBoost = Math.max(0, 1.5 - (ageDays / 14) * 1.5);
+
+  return Number((base + topicBoost + followBoost + recencyBoost).toFixed(4));
+};
+
 module.exports = {
   computeTagScore,
   computeEngagementScore,
   computeRankingScore,
   informativeFromTags,
   scoreVideo,
+  // Content-preferences engine
+  TOPIC_SIGNALS,
+  AVAILABLE_TOPICS,
+  topicMatchCount,
+  computeSensitivity,
+  personalizeScore,
+  SENSITIVE_CONFIDENCE_FLOOR,
   // Exposed for tests
   TECHNICAL_TAGS, EDUCATIONAL_TAGS, PENALTY_TAGS,
 };

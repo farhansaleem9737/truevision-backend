@@ -65,6 +65,8 @@ const commentSchema = new mongoose.Schema({
 // ── Indexes ───────────────────────────────────────────────────────────────────
 commentSchema.index({ videoId: 1, isPinned: -1, createdAt: -1 });
 commentSchema.index({ videoId: 1, likesCount: -1 });
+// "My Activity → Comments" listing: one user's comments, newest first.
+commentSchema.index({ userId: 1, createdAt: -1 });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 commentSchema.methods.isLikedBy = function (uid) { return this.likes.some(id => id.equals(uid)); };

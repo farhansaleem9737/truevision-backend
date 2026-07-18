@@ -1,6 +1,7 @@
 //Backend/models/User.js
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
 const userSchema = new mongoose.Schema({
   fullName: {
@@ -79,9 +80,14 @@ const userSchema = new mongoose.Schema({
     enum: ['user', 'creator', 'admin'],
     default: 'user'
   },
+  // Verified-account badge (also gates the "verified" checkmark in the UI).
+  // NOTE: this field previously appeared twice in the schema (once here, once
+  // in the chat/social block) — the duplicate silently overrode this one.
+  // Single definition now, with the index the duplicate carried.
   isVerified: {
     type: Boolean,
-    default: false
+    default: false,
+    index: true
   },
   verificationOTP: {
     type: String,
@@ -119,6 +125,17 @@ const userSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
   }],
+  // ── Language ───────────────────────────────────────────────────────────
+  // Canonical UI language for this account (ISO 639-1). This is the single
+  // source of truth that the i18n system restores on login. The legacy
+  // `preferences.language` mirror is kept in sync by SettingsController for
+  // backward-compat but new code should read/write this field.
+  language: {
+    type:    String,
+    enum:    ['en', 'ur', 'ar', 'hi', 'tr', 'fr'],
+    default: 'en',
+  },
+
   // Preferences blob — privacy, notifications, content, language.
   // Mixed type lets the client send partial updates that the controller deep-merges.
   preferences: {
@@ -134,9 +151,14 @@ const userSchema = new mongoose.Schema({
     ref:  'User',
   }],
 
-  // Verified-account badge (Instagram/Twitter-style). Reserved field —
-  // no self-serve flow yet; toggled manually or by a future review process.
-  isVerified: { type: Boolean, default: false, index: true },
+  // Incoming follow requests (private accounts only). Public accounts gain
+  // followers instantly and never touch this array. Each entry is the
+  // requesting user + when they asked; accept moves them into `followers`,
+  // decline simply removes the entry.
+  followRequests: [{
+    from:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    requestedAt: { type: Date, default: Date.now },
+  }],
 
   // ── Push notifications ─────────────────────────────────────────────────
   // Expo push tokens (ExponentPushToken[...]) — one per installed device.
@@ -146,6 +168,36 @@ const userSchema = new mongoose.Schema({
   // Messaging natively). Both are consulted when we fan out a push.
   expoPushTokens: [{ type: String }],
   fcmTokens:      [{ type: String }],
+
+  // ── Security module ──────────────────────────────────────────────────────
+  // Two-factor authentication (email OTP). The OTP itself is stored as a
+  // sha256 hash — unlike the legacy verification/reset OTPs above, a DB leak
+  // must not reveal live codes.
+  twoFactorEnabled:    { type: Boolean, default: false },
+  twoFactorOTP:        { type: String,  select: false, default: null },  // sha256 hex
+  twoFactorOTPExpires: { type: Date,    select: false, default: null },
+
+  // Set on every password change; any JWT whose iat predates
+  // tokenInvalidBefore is rejected by middleware/Auth.protect — this is what
+  // makes "change password → every device logs out" and "log out from all
+  // devices" work without tracking individual tokens.
+  passwordChangedAt:  { type: Date, default: null },
+  tokenInvalidBefore: { type: Date, default: null },
+
+  // Phone verification. Number stored E.164-ish (+<country><number>).
+  // OTP hashed the same way as 2FA.
+  phoneNumber:      { type: String,  default: null, trim: true, maxlength: 20 },
+  phoneCountryCode: { type: String,  default: null, trim: true, maxlength: 6 },
+  phoneVerified:    { type: Boolean, default: false },
+  phoneOTP:         { type: String,  select: false, default: null },
+  phoneOTPExpires:  { type: Date,    select: false, default: null },
+  // Where the phone OTP is pending for — set at send-phone-otp so verify
+  // can't be tricked into confirming a different number than the one the
+  // code was issued for.
+  phonePending:     { type: String,  select: false, default: null },
+
+  // Weekly email report bookkeeping (preferences.notifications.emailWeekly).
+  lastWeeklyReportAt: { type: Date, default: null },
 }, {
   timestamps: true
 });
@@ -178,15 +230,56 @@ userSchema.methods.generateResetPasswordOTP = function() {
 userSchema.methods.verifyOTP = function(otp, type = 'verification') {
   const otpField = type === 'verification' ? 'verificationOTP' : 'resetPasswordOTP';
   const expiresField = type === 'verification' ? 'verificationOTPExpires' : 'resetPasswordOTPExpires';
-  
+
   if (this[otpField] !== otp) {
     return { success: false, message: 'Invalid OTP' };
   }
-  
+
   if (Date.now() > this[expiresField]) {
     return { success: false, message: 'OTP has expired' };
   }
-  
+
+  return { success: true };
+};
+
+// ── Hashed OTPs for the Security module (2FA + phone) ───────────────────────
+// sha256 rather than bcrypt: OTPs are 6 digits with a 10-minute life, so the
+// threat is DB exposure of a live code, not offline brute force — a fast hash
+// is fine and keeps the verify path cheap.
+const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
+
+const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+/** Generate + store a hashed OTP for 'twoFactor' | 'phone'. Returns the plain code for delivery. */
+userSchema.methods.generateHashedOTP = function(kind) {
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  if (kind === 'phone') {
+    this.phoneOTP        = sha256(otp);
+    this.phoneOTPExpires = new Date(Date.now() + OTP_TTL_MS);
+  } else {
+    this.twoFactorOTP        = sha256(otp);
+    this.twoFactorOTPExpires = new Date(Date.now() + OTP_TTL_MS);
+  }
+  return otp;
+};
+
+/** Constant-shape verifier for hashed OTPs. Clears the stored code on success. */
+userSchema.methods.verifyHashedOTP = function(kind, otp) {
+  const hashField   = kind === 'phone' ? 'phoneOTP'        : 'twoFactorOTP';
+  const expiryField = kind === 'phone' ? 'phoneOTPExpires' : 'twoFactorOTPExpires';
+
+  if (!this[hashField] || !this[expiryField]) {
+    return { success: false, message: 'No code was requested. Tap resend to get a new one.' };
+  }
+  if (Date.now() > new Date(this[expiryField]).getTime()) {
+    return { success: false, message: 'Code expired. Tap resend to get a new one.' };
+  }
+  if (this[hashField] !== sha256(otp)) {
+    return { success: false, message: 'Incorrect code. Check the digits and try again.' };
+  }
+  // One-time use.
+  this[hashField]   = null;
+  this[expiryField] = null;
   return { success: true };
 };
 

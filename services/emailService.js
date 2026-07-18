@@ -772,6 +772,157 @@ exports.sendPasswordResetEmail = async (email, fullName, otp) => {
   }
 };
 
+// ── Security module emails ───────────────────────────────────────────────
+// One compact template shared by 2FA sign-in codes, 2FA enable/disable
+// verification, and phone-verification fallback delivery. Deliberately
+// plainer than the big marketing-style templates above — these are
+// transactional codes the user is waiting on.
+const getOtpEmailHTML = (fullName, otp, purposeLabel, ttlMinutes) => `
+<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
+  <div style="max-width:520px;margin:24px auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e2e8f0">
+    <div style="background:#0060DF;padding:20px 28px">
+      <div style="color:#fff;font-size:19px;font-weight:800;letter-spacing:.3px">TrueVision Security</div>
+    </div>
+    <div style="padding:28px">
+      <p style="margin:0 0 6px;color:#0f172a;font-size:15px">Hi ${fullName || 'there'},</p>
+      <p style="margin:0 0 18px;color:#334155;font-size:14px;line-height:21px">
+        Your one-time code for <strong>${purposeLabel}</strong>:
+      </p>
+      <div style="text-align:center;margin:8px 0 18px">
+        <span style="display:inline-block;background:#f1f5f9;border:1px dashed #94a3b8;border-radius:10px;
+                     padding:12px 26px;font-size:30px;font-weight:800;letter-spacing:10px;color:#0f172a">${otp}</span>
+      </div>
+      <p style="margin:0 0 6px;color:#64748b;font-size:12.5px">
+        Valid for ${ttlMinutes} minutes. Never share this code — TrueVision staff will never ask for it.
+      </p>
+      <p style="margin:0;color:#64748b;font-size:12.5px">
+        If you didn't request this, you can safely ignore this email.
+      </p>
+    </div>
+    <div style="padding:14px 28px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:11.5px">
+      © ${new Date().getFullYear()} TrueVision · automated message, do not reply
+    </div>
+  </div>
+</body>
+</html>`;
+
+/**
+ * Send a security OTP email.
+ * purpose: 'signin-2fa' | 'enable-2fa' | 'disable-2fa' | 'phone-verify'
+ */
+exports.sendSecurityOtpEmail = async (email, fullName, otp, purpose = 'signin-2fa') => {
+  const labels = {
+    'signin-2fa':   'signing in with two-factor authentication',
+    'enable-2fa':   'turning ON two-factor authentication',
+    'disable-2fa':  'turning OFF two-factor authentication',
+    'phone-verify': 'verifying your phone number',
+  };
+  try {
+    const transporter = await getTransporter();
+    const info = await transporter.sendMail({
+      from:    { name: 'TrueVision Security', address: readUser() },
+      to:      email,
+      subject: `🔐 ${otp} is your TrueVision code`,
+      html:    getOtpEmailHTML(fullName, otp, labels[purpose] || 'your security request', 10),
+      text:    `Your TrueVision code is ${otp} (for ${labels[purpose] || 'your security request'}). Valid for 10 minutes.`,
+    });
+    console.log('[emailService] Security OTP sent', { to: email, purpose, messageId: info.messageId });
+    return { success: true, messageId: info.messageId };
+  } catch (error) {
+    const detail = formatSmtpError(error);
+    console.error('[emailService] sendSecurityOtpEmail FAILED', { to: email, purpose, ...detail });
+    return { success: false, error: detail };
+  }
+};
+
+/**
+ * Security alert email — password changed, new login, phone changed, etc.
+ * Sent only when the user's preferences.notifications.emailSecurity is on
+ * (callers check the preference; this function just delivers).
+ */
+exports.sendSecurityAlertEmail = async (email, fullName, { title, lines = [] }) => {
+  try {
+    const transporter = await getTransporter();
+    const listHtml = lines.map((l) => `<li style="margin:4px 0;color:#334155;font-size:13.5px">${l}</li>`).join('');
+    const info = await transporter.sendMail({
+      from:    { name: 'TrueVision Security', address: readUser() },
+      to:      email,
+      subject: `🛡️ ${title}`,
+      html: `
+<!DOCTYPE html><html><body style="margin:0;padding:0;background:#f1f5f9;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
+  <div style="max-width:520px;margin:24px auto;background:#fff;border-radius:14px;overflow:hidden;border:1px solid #e2e8f0">
+    <div style="background:#0f172a;padding:20px 28px">
+      <div style="color:#fff;font-size:19px;font-weight:800">TrueVision Security Alert</div>
+    </div>
+    <div style="padding:28px">
+      <p style="margin:0 0 8px;color:#0f172a;font-size:15px;font-weight:700">${title}</p>
+      <p style="margin:0 0 12px;color:#334155;font-size:14px">Hi ${fullName || 'there'}, here are the details:</p>
+      <ul style="margin:0 0 16px;padding-left:18px">${listHtml}</ul>
+      <p style="margin:0;color:#64748b;font-size:12.5px">
+        If this was you, no action is needed. If not, change your password immediately and
+        log out from all devices in Settings → Security.
+      </p>
+    </div>
+    <div style="padding:14px 28px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:11.5px">
+      © ${new Date().getFullYear()} TrueVision · automated message, do not reply
+    </div>
+  </div>
+</body></html>`,
+      text: `${title}\n\n${lines.join('\n')}\n\nIf this wasn't you, change your password immediately.`,
+    });
+    console.log('[emailService] Security alert sent', { to: email, title, messageId: info.messageId });
+    return { success: true, messageId: info.messageId };
+  } catch (error) {
+    const detail = formatSmtpError(error);
+    console.error('[emailService] sendSecurityAlertEmail FAILED', { to: email, ...detail });
+    return { success: false, error: detail };
+  }
+};
+
+/**
+ * Weekly creator report. statsHtmlRows: array of [label, value] pairs.
+ */
+exports.sendWeeklyReportEmail = async (email, fullName, stats) => {
+  try {
+    const transporter = await getTransporter();
+    const rows = Object.entries(stats)
+      .map(([label, value]) => `
+        <tr>
+          <td style="padding:9px 14px;border-bottom:1px solid #f1f5f9;color:#334155;font-size:13.5px">${label}</td>
+          <td style="padding:9px 14px;border-bottom:1px solid #f1f5f9;color:#0f172a;font-size:13.5px;font-weight:700;text-align:right">${value}</td>
+        </tr>`)
+      .join('');
+    const info = await transporter.sendMail({
+      from:    { name: 'TrueVision', address: readUser() },
+      to:      email,
+      subject: '📊 Your TrueVision weekly report',
+      html: `
+<!DOCTYPE html><html><body style="margin:0;padding:0;background:#f1f5f9;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
+  <div style="max-width:520px;margin:24px auto;background:#fff;border-radius:14px;overflow:hidden;border:1px solid #e2e8f0">
+    <div style="background:#0060DF;padding:20px 28px">
+      <div style="color:#fff;font-size:19px;font-weight:800">Your week on TrueVision</div>
+    </div>
+    <div style="padding:24px 28px">
+      <p style="margin:0 0 14px;color:#334155;font-size:14px">Hi ${fullName || 'there'}, here's how your last 7 days went:</p>
+      <table style="width:100%;border-collapse:collapse;border:1px solid #e2e8f0;border-radius:10px;overflow:hidden">${rows}</table>
+      <p style="margin:16px 0 0;color:#64748b;font-size:12px">
+        You're receiving this because Weekly Reports is enabled in Settings → Notifications.
+      </p>
+    </div>
+  </div>
+</body></html>`,
+      text: `Your TrueVision weekly report:\n${Object.entries(stats).map(([k, v]) => `${k}: ${v}`).join('\n')}`,
+    });
+    return { success: true, messageId: info.messageId };
+  } catch (error) {
+    const detail = formatSmtpError(error);
+    console.error('[emailService] sendWeeklyReportEmail FAILED', { to: email, ...detail });
+    return { success: false, error: detail };
+  }
+};
+
 // ── Diagnostic / test helper ───────────────────────────────────────────────
 // Used by the GET /api/auth/test-email route. Lets you confirm SMTP works
 // without going through the register flow.

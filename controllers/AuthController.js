@@ -2,8 +2,10 @@ const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { OAuth2Client } = require('google-auth-library');
-const { sendVerificationEmail, sendPasswordResetEmail, sendTestEmail } = require('../services/emailService');
+const { sendVerificationEmail, sendPasswordResetEmail, sendTestEmail,
+        sendSecurityOtpEmail, sendSecurityAlertEmail } = require('../services/emailService');
 const cloudinary = require('../config/cloudinary');
+const sessionTracker = require('../services/sessionTracker');
 
 // One client per process — used to verify ID tokens issued by Google.
 // We accept tokens minted for any of the three OAuth client IDs we register
@@ -21,6 +23,59 @@ const generateToken = (userId) => {
   return jwt.sign({ userId }, process.env.JWT_SECRET, {
     expiresIn: process.env.JWT_EXPIRES_IN || '30d'
   });
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared 2FA challenge — used by BOTH the password and the Google sign-in
+// paths so a second factor can never be skipped by choosing a different
+// provider. Issues the OTP and returns the response body the client expects
+// ({ requires2FA, pendingToken }), or null when 2FA is off for this account.
+//
+// Delivery prefers the account's VERIFIED PHONE when one exists and an SMS
+// provider is configured, falling back to email. That gives a working second
+// channel so a broken mailbox can't lock the user out permanently.
+// ─────────────────────────────────────────────────────────────────────────────
+const issueTwoFactorChallenge = async (user) => {
+  if (!user.twoFactorEnabled) return null;
+
+  const otp = user.generateHashedOTP('twoFactor');
+  await user.save();
+
+  let channel = 'email';
+  let sent    = { success: false };
+
+  const smsService = require('../services/smsService');
+  if (user.phoneVerified && user.phoneNumber && smsService.smsConfigured()) {
+    const full = `${user.phoneCountryCode || ''}${user.phoneNumber}`;
+    sent = await smsService.sendPhoneOtp(user, full, otp);
+    channel = sent.channel || 'sms';
+  }
+  if (!sent.success) {
+    sent    = await sendSecurityOtpEmail(user.email, user.fullName, otp, 'signin-2fa');
+    channel = 'email';
+  }
+  if (!sent.success) {
+    return { error: 'Could not send your sign-in code. Try again shortly.' };
+  }
+
+  const pendingToken = jwt.sign(
+    { userId: user._id, purpose: '2fa-pending' },
+    process.env.JWT_SECRET,
+    { expiresIn: '10m' },
+  );
+
+  const masked = channel === 'sms'
+    ? `your phone ending ${String(user.phoneNumber).slice(-4)}`
+    : user.email;
+
+  return {
+    body: {
+      success: true,
+      requires2FA: true,
+      message: `Enter the 6-digit code we sent to ${masked}`,
+      data: { pendingToken, email: user.email, channel },
+    },
+  };
 };
 
 // @desc    Register new user
@@ -173,6 +228,7 @@ exports.verifyEmail = async (req, res) => {
 
     // Generate token
     const token = generateToken(user._id);
+    sessionTracker.recordLogin(req, user, token, 'email-verify').catch(() => {});
 
     res.status(200).json({
       success: true,
@@ -321,12 +377,37 @@ exports.login = async (req, res) => {
       });
     }
 
+    // ── Two-factor gate ─────────────────────────────────────────────────────
+    // Password was correct, but 2FA is on: do NOT issue a session token.
+    // Send a code and hand back a short-lived pending token that is only
+    // accepted by POST /api/auth/2fa-verify (protect(), maybeAuth() and the
+    // socket handshake all reject purpose='2fa-pending').
+    const challenge = await issueTwoFactorChallenge(user);
+    if (challenge?.error)  return res.status(502).json({ success: false, message: challenge.error });
+    if (challenge?.body)   return res.status(200).json(challenge.body);
+
     // Update last login
     user.lastLogin = new Date();
     await user.save();
 
     // Generate token
     const token = generateToken(user._id);
+
+    // Login-activity row + optional new-login security alert (fire-and-forget).
+    sessionTracker.recordLogin(req, user, token, 'password').then((session) => {
+      const alertsOn = user.preferences?.notifications?.emailSecurity !== false;
+      if (alertsOn && session) {
+        const where = [session.city, session.country].filter(Boolean).join(', ') || 'Unknown location';
+        sendSecurityAlertEmail(user.email, user.fullName, {
+          title: 'New sign-in to your TrueVision account',
+          lines: [
+            `Device: ${session.deviceName || 'Unknown device'} (${session.deviceOS || 'unknown OS'})`,
+            `Location: ${where}${session.ip ? ` — IP ${session.ip}` : ''}`,
+            `When: ${new Date().toUTCString()}`,
+          ],
+        }).catch(() => {});
+      }
+    }).catch(() => {});
 
     res.status(200).json({
       success: true,
@@ -352,6 +433,107 @@ exports.login = async (req, res) => {
       success: false,
       message: 'Login failed. Please try again.'
     });
+  }
+};
+
+// @desc    Complete a 2FA sign-in — exchange pendingToken + OTP for a session
+// @route   POST /api/auth/2fa-verify
+// @access  Public (authenticated by the pendingToken itself)
+exports.twoFactorVerify = async (req, res) => {
+  try {
+    const { pendingToken, otp } = req.body || {};
+    if (!pendingToken || !otp) {
+      return res.status(400).json({ success: false, message: 'Code and pending token are required' });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(pendingToken, process.env.JWT_SECRET);
+    } catch (_) {
+      return res.status(401).json({
+        success: false,
+        message: 'Your sign-in window expired. Enter your password again.',
+        code: 'PENDING_EXPIRED',
+      });
+    }
+    if (decoded.purpose !== '2fa-pending') {
+      return res.status(401).json({ success: false, message: 'Invalid sign-in token' });
+    }
+
+    const user = await User.findById(decoded.userId)
+      .select('+twoFactorOTP +twoFactorOTPExpires');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const check = user.verifyHashedOTP('twoFactor', otp);
+    if (!check.success) return res.status(401).json({ success: false, message: check.message });
+
+    user.lastLogin = new Date();
+    await user.save();
+
+    const token = generateToken(user._id);
+    sessionTracker.recordLogin(req, user, token, '2fa').catch(() => {});
+
+    return res.status(200).json({
+      success: true,
+      message: 'Login successful!',
+      data: {
+        token,
+        user: {
+          _id: user._id,
+          fullName: user.fullName,
+          username: user.username,
+          email: user.email,
+          country: user.country,
+          profileImage: user.profileImage,
+          role: user.role,
+          isVerified: user.isVerified,
+          createdAt: user.createdAt,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('twoFactorVerify error:', error);
+    return res.status(500).json({ success: false, message: 'Sign-in failed. Please try again.' });
+  }
+};
+
+// @desc    Resend the 2FA sign-in code (pending-token holders only)
+// @route   POST /api/auth/2fa-resend
+// @access  Public (pendingToken)
+exports.twoFactorResend = async (req, res) => {
+  try {
+    const { pendingToken } = req.body || {};
+    if (!pendingToken) return res.status(400).json({ success: false, message: 'Pending token required' });
+
+    let decoded;
+    try {
+      decoded = jwt.verify(pendingToken, process.env.JWT_SECRET);
+    } catch (_) {
+      return res.status(401).json({
+        success: false,
+        message: 'Your sign-in window expired. Enter your password again.',
+        code: 'PENDING_EXPIRED',
+      });
+    }
+    if (decoded.purpose !== '2fa-pending') {
+      return res.status(401).json({ success: false, message: 'Invalid sign-in token' });
+    }
+
+    const user = await User.findById(decoded.userId)
+      .select('+twoFactorOTP +twoFactorOTPExpires');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const otp = user.generateHashedOTP('twoFactor');
+    await user.save();
+
+    const sent = await sendSecurityOtpEmail(user.email, user.fullName, otp, 'signin-2fa');
+    if (!sent.success) {
+      return res.status(502).json({ success: false, message: 'Could not resend the code. Try again shortly.' });
+    }
+    return res.status(200).json({ success: true, message: `New code sent to ${user.email}` });
+  } catch (error) {
+    console.error('twoFactorResend error:', error);
+    return res.status(500).json({ success: false, message: 'Could not resend the code' });
   }
 };
 
@@ -472,11 +654,19 @@ exports.googleSignIn = async (req, res) => {
       }
     }
 
-    // 3) Bookkeeping + JWT, identical to the /login response envelope.
+    // 3) Two-factor gate — the SAME gate the password path enforces. Without
+    //    this, an account with 2FA on could skip the second factor simply by
+    //    choosing "Sign in with Google", which defeats the whole feature.
+    const challenge = await issueTwoFactorChallenge(user);
+    if (challenge?.error) return res.status(502).json({ success: false, message: challenge.error });
+    if (challenge?.body)  return res.status(200).json(challenge.body);
+
+    // 4) Bookkeeping + JWT, identical to the /login response envelope.
     user.lastLogin = new Date();
     await user.save();
 
     const token = generateToken(user._id);
+    sessionTracker.recordLogin(req, user, token, 'google').catch(() => {});
 
     return res.status(200).json({
       success: true,
@@ -651,7 +841,23 @@ exports.resetPassword = async (req, res) => {
     user.password = newPassword;
     user.resetPasswordOTP = undefined;
     user.resetPasswordOTPExpires = undefined;
+
+    // A forgot-password reset is the classic "my account was compromised"
+    // action, so it MUST revoke everything — same as an in-app password
+    // change. Without this, an attacker's 30-day JWT survives the reset.
+    user.passwordChangedAt  = new Date();
+    user.tokenInvalidBefore = new Date();
     await user.save();
+
+    // Kill live sockets + mark every session revoked in the audit trail.
+    try { require('../socket').disconnectUser(user._id, 'password-reset'); } catch (_) {}
+    try {
+      const LoginSession = require('../models/LoginSession');
+      LoginSession.updateMany(
+        { userId: user._id, revokedAt: null, logoutAt: null },
+        { $set: { revokedAt: new Date() } },
+      ).catch(() => {});
+    } catch (_) { /* best-effort */ }
 
     res.status(200).json({
       success: true,
@@ -751,6 +957,8 @@ exports.logout = async (req, res) => {
   try {
     const { revokeToken } = require('../middleware/Auth');
     if (req.authToken) await revokeToken(req.authToken);
+    // Close the LoginSession row for this device (Security → Login Activity).
+    sessionTracker.recordLogout(req.user?._id, req.tokenIat).catch(() => {});
     return res.status(200).json({ success: true, message: 'Signed out.' });
   } catch (err) {
     console.error('logout error:', err);

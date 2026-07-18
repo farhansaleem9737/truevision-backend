@@ -55,11 +55,15 @@ const messageSchema = new mongoose.Schema({
   // ── Idempotency ────────────────────────────────────────────────────────
   // Client-supplied UUID. Two writes with the same key from the same sender
   // are collapsed to one — protects against the "spinner froze so the user
-  // tapped send twice" duplicate. Sparse so old messages without the field
-  // don't collide on a null key.
+  // tapped send twice" duplicate.
+  //
+  // IMPORTANT: no `default: null` here. A sparse unique index skips documents
+  // where the field is MISSING, but it DOES index explicit nulls — so storing
+  // null would make every keyless message (forwards, system sends) collide
+  // with the next one. createMessageDoc passes `undefined` when the client
+  // supplied no key, which keeps the field off the document entirely.
   clientMsgId: {
     type:   String,
-    default: null,
     index:  { unique: true, sparse: true },
   },
 

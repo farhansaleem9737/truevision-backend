@@ -1,7 +1,7 @@
 // Backend/routes/VideoRoutes.js
 const express  = require('express');
 const router   = express.Router();
-const { protect } = require('../middleware/Auth');
+const { protect, maybeAuth } = require('../middleware/Auth');
 const { upload } = require('../middleware/upload');
 
 const {
@@ -14,6 +14,10 @@ const {
   updateVideo,
   deleteVideo,
   togglePin,
+  toggleLikeCountVisibility,
+  toggleShareCountVisibility,
+  toggleArchive,
+  getArchivedVideos,
   searchVideos,
   searchHashtags,
   recomputeRankings,
@@ -63,7 +67,10 @@ router.post('/create', protect, createVideo);
 // ─────────────────────────────────────────────────────────────────────────────
 
 // GET    /api/videos/feed            — Paginated public feed
-router.get('/feed', getFeed);
+// maybeAuth (not protect): the feed is public, but when a valid token IS
+// present req.user powers per-viewer behaviour — notInterested filtering,
+// isLiked/isSaved flags, and the owner exemption in the hide-count strip.
+router.get('/feed', maybeAuth, getFeed);
 
 // POST   /api/videos/admin/recompute-rankings  — Backfill ranking scores
 //        Optional: ?ai=true to call Gemini on un-analysed videos
@@ -71,7 +78,7 @@ router.get('/feed', getFeed);
 router.post('/admin/recompute-rankings', protect, recomputeRankings);
 
 // GET    /api/videos/search          — Search videos by keyword
-router.get('/search', searchVideos);
+router.get('/search', maybeAuth, searchVideos);
 
 // GET    /api/videos/search/hashtags — Search hashtags (aggregated from tags)
 router.get('/search/hashtags', searchHashtags);
@@ -85,11 +92,16 @@ router.get('/liked',     protect, getLikedVideos);
 // GET    /api/videos/favorites       — Current user's favorite videos (auth required)
 router.get('/favorites', protect, getFavoriteVideos);
 
+// GET    /api/videos/archived        — Current user's archived videos (auth required, owner-only list)
+router.get('/archived',  protect, getArchivedVideos);
+
 // GET    /api/videos/user/:userId    — Videos uploaded by a specific user
-router.get('/user/:userId', getUserVideos);
+// maybeAuth: isOwner controls private-video visibility + hide-count strip.
+router.get('/user/:userId', maybeAuth, getUserVideos);
 
 // GET    /api/videos/:id             — Single video details
-router.get('/:id', getVideoById);
+// maybeAuth: owner exemption for archived videos + hide-count strip.
+router.get('/:id', maybeAuth, getVideoById);
 
 // PUT    /api/videos/:id             — Update video metadata (owner only)
 router.put('/:id', protect, updateVideo);
@@ -99,6 +111,15 @@ router.delete('/:id', protect, deleteVideo);
 
 // PUT    /api/videos/:id/pin         — Pin/unpin to creator profile (owner only)
 router.put('/:id/pin', protect, togglePin);
+
+// PUT    /api/videos/:id/hide-like-count   — Hide/show like count (owner only)
+router.put('/:id/hide-like-count',  protect, toggleLikeCountVisibility);
+
+// PUT    /api/videos/:id/hide-share-count  — Hide/show share count (owner only)
+router.put('/:id/hide-share-count', protect, toggleShareCountVisibility);
+
+// PUT    /api/videos/:id/archive     — Archive/restore (owner only)
+router.put('/:id/archive',          protect, toggleArchive);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // VIDEO — SOCIAL ACTIONS  (all auth required)
@@ -120,13 +141,14 @@ router.post('/:id/favorite',       protect, toggleFavorite);
 router.post('/:id/not-interested', protect, markNotInterested);
 
 // POST   /api/videos/:id/view            — Record a view (auth optional)
-router.post('/:id/view',           recordView);
+router.post('/:id/view',           maybeAuth, recordView);
 
 // POST   /api/videos/:id/download        — Get signed download URL
 router.post('/:id/download',       protect, downloadVideo);
 
-// POST   /api/videos/:id/share           — Increment share count
-router.post('/:id/share',          shareVideo);
+// POST   /api/videos/:id/share           — Increment share count (auth optional:
+//        signed-in sharers also get a SharedVideo history row)
+router.post('/:id/share',          maybeAuth, shareVideo);
 
 // POST   /api/videos/:id/report          — Report video
 router.post('/:id/report',         protect, reportVideo);
@@ -136,7 +158,8 @@ router.post('/:id/report',         protect, reportVideo);
 // ─────────────────────────────────────────────────────────────────────────────
 
 // GET    /api/videos/:id/comments                              — Fetch comments
-router.get('/:id/comments',                                      getComments);
+// maybeAuth: comments inherit the video's visibility/privacy gates.
+router.get('/:id/comments',                            maybeAuth, getComments);
 
 // POST   /api/videos/:id/comments                              — Add comment
 router.post('/:id/comments',                             protect, addComment);

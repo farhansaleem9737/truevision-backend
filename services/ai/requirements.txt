@@ -19,5 +19,14 @@ numpy>=1.26.0
 nudenet>=3.4.0
 pillow>=10.1.0
 
-# HTTP client used to fetch Cloudinary frames
+# HTTP client used to fetch Cloudinary frames + /transcribe video downloads
 httpx>=0.26.0
+
+# Speech-to-text for /transcribe (open-source Whisper via CTranslate2).
+# Pulls in ctranslate2 + tokenizers + onnxruntime. Model weights (`base`,
+# ~140 MB) auto-download to the HF cache on first run, then run locally.
+# NOTE: FFmpeg is a SYSTEM dependency (not pip) — see README.
+faster-whisper>=1.0.0
+
+# Multipart parsing for the /transcribe file upload path.
+python-multipart>=0.0.9

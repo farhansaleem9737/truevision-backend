@@ -50,13 +50,11 @@ const warnOnce = () => {
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /**
- * Send a chat push to every device the recipient has registered.
- *
- * @param {Object}   user         Recipient user doc (must include expoPushTokens & fcmTokens)
- * @param {Object}   payload      { title, body, chatId, senderId, messageId, type }
- * @returns {Promise<{sent: number, failed: number}>}
+ * Core delivery — fan a {title, body, data, channelId} out to every device
+ * the recipient has registered, over whichever providers are configured.
+ * All public senders below are thin wrappers around this.
  */
-exports.sendChatNotification = async (user, payload) => {
+const deliver = async (user, { title, body, data = {}, channelId = 'default', badge }) => {
   if (!user) return { sent: 0, failed: 0 };
   const expoTokens = (user.expoPushTokens || []).filter(t => Expo?.isExpoPushToken?.(t));
   const fcmTokens  = user.fcmTokens || [];
@@ -71,18 +69,15 @@ exports.sendChatNotification = async (user, payload) => {
     const messages = expoTokens.map((to) => ({
       to,
       sound: 'default',
-      title: payload.title || 'New message',
-      body:  payload.body  || '',
-      // Attaching data lets the app deep-link to the chat when tapped.
-      data: {
-        chatId:    payload.chatId    || null,
-        senderId:  payload.senderId  || null,
-        messageId: payload.messageId || null,
-        type:      payload.type      || 'text',
-      },
+      title: title || 'TrueVision',
+      body:  body  || '',
+      // Attached data lets the app deep-link when the notification is tapped.
+      data,
       // High-priority so Android delivers immediately even when doze-mode.
       priority: 'high',
-      channelId: 'chat-messages',
+      channelId,
+      // iOS app-icon badge — notificationCenter passes the unread count.
+      ...(Number.isFinite(badge) ? { badge } : {}),
     }));
 
     for (const chunk of expo.chunkPushNotifications(messages)) {
@@ -99,19 +94,14 @@ exports.sendChatNotification = async (user, payload) => {
   // FCM path — direct send. Kept simple; a future dev-client can lean on this.
   if (admin && fcmTokens.length) {
     try {
+      const stringData = Object.fromEntries(
+        Object.entries(data).map(([k, v]) => [k, String(v ?? '')]),
+      );
       const resp = await admin.messaging().sendEachForMulticast({
         tokens: fcmTokens,
-        notification: {
-          title: payload.title || 'New message',
-          body:  payload.body  || '',
-        },
-        data: {
-          chatId:    String(payload.chatId    || ''),
-          senderId:  String(payload.senderId  || ''),
-          messageId: String(payload.messageId || ''),
-          type:      String(payload.type      || 'text'),
-        },
-        android: { priority: 'high', notification: { channelId: 'chat-messages' } },
+        notification: { title: title || 'TrueVision', body: body || '' },
+        data: stringData,
+        android: { priority: 'high', notification: { channelId } },
       });
       sent   += resp.successCount || 0;
       failed += resp.failureCount || 0;
@@ -123,6 +113,52 @@ exports.sendChatNotification = async (user, payload) => {
 
   return { sent, failed };
 };
+
+/**
+ * Send a chat push to every device the recipient has registered.
+ *
+ * @param {Object}   user         Recipient user doc (must include expoPushTokens & fcmTokens)
+ * @param {Object}   payload      { title, body, chatId, senderId, messageId, type }
+ * @returns {Promise<{sent: number, failed: number}>}
+ */
+exports.sendChatNotification = (user, payload) =>
+  deliver(user, {
+    title: payload.title || 'New message',
+    body:  payload.body  || '',
+    data: {
+      chatId:    payload.chatId    || null,
+      senderId:  payload.senderId  || null,
+      messageId: payload.messageId || null,
+      type:      payload.type      || 'text',
+    },
+    channelId: 'chat-messages',
+    badge: payload.badge,
+  });
+
+/**
+ * Social-graph pushes: new follower, follow request, request accepted.
+ *
+ * @param {Object} user     Recipient user doc (expoPushTokens & fcmTokens)
+ * @param {Object} payload  { title, body, kind: 'follow'|'follow_request'|'request_accepted', fromUserId }
+ */
+exports.sendSocialNotification = (user, payload) =>
+  deliver(user, {
+    title: payload.title || 'TrueVision',
+    body:  payload.body  || '',
+    data: {
+      // Spread the caller's data FIRST so deep-link ids (videoId, commentId,
+      // chatId…) survive; the explicit keys below stay authoritative.
+      ...(payload.data || {}),
+      kind:       payload.kind       || 'social',
+      // `type` is the ACTION ('like'/'comment'/'mention'/'follow'), which the
+      // caller supplies in data. Only fall back to kind when it's absent, so
+      // a push tap can navigate exactly like the stored history row says.
+      type:       payload.data?.type || payload.kind || 'social',
+      fromUserId: payload.fromUserId || null,
+    },
+    channelId: 'social',
+    badge: payload.badge,
+  });
 
 /**
  * Small helper to build a preview line for a message.
