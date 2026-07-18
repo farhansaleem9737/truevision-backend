@@ -1570,7 +1570,7 @@ exports.getLikedVideos    = buildCollection(uid => ({ likes:     uid }));
 exports.getFavoriteVideos = buildCollection(uid => ({ favorites: uid }));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SPEECH-TO-TEXT PIPELINE  (FFmpeg → Faster-Whisper → DistilBERT → MongoDB)
+// SPEECH-TO-TEXT PIPELINE  (FFmpeg → Faster-Whisper → BART zero-shot → MongoDB)
 //
 // Runs after the existing ranking pass so it can never delay or race it. All
 // writes are targeted $set updates on the transcription sub-document, so a
@@ -1580,14 +1580,17 @@ exports.getFavoriteVideos = buildCollection(uid => ({ favorites: uid }));
 // Never throws: a transcription outage must not affect the upload pipeline.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// DistilBERT labels → the existing `aiCategory` enum. Only unambiguous
-// matches are mapped; "Professional" has no enum equivalent, and guessing
-// ("business"?) would mislabel content, so it's deliberately left out.
+// Zero-shot (BART) labels → the existing `aiCategory` enum. Only labels with a
+// clean enum equivalent are mapped; "Poetry" has none, so it's intentionally
+// left out (the transcript + confidence are still stored, just not adopted as
+// the ranking category).
 const TRANSCRIPT_CATEGORY_MAP = {
   educational:   'educational',
   technical:     'technical',
+  professional:  'business',     // closest enum bucket for professional content
   news:          'news',
   entertainment: 'entertainment',
+  islamic:       'islamic',
 };
 
 async function runTranscription(video) {
@@ -1610,11 +1613,17 @@ async function runTranscription(video) {
 
     const empty = !!res.empty || !String(res.transcript || '').trim();
 
+    // Persist the BART text-moderation decision so the "Decision Engine" stage
+    // isn't dropped (ACCEPT / REVIEW / null-when-empty).
+    const decision = empty ? null : (['ACCEPT', 'REVIEW'].includes(res.moderation) ? res.moderation : null);
+
     const set = {
       'transcription.text':             String(res.transcript || ''),
       'transcription.language':         String(res.language || ''),
       'transcription.category':         empty ? null : (res.category ?? null),
       'transcription.confidence':       empty ? 0 : Number(res.confidence) || 0,
+      'transcription.moderation':       decision,
+      'transcription.moderationReason': empty ? '' : String(res.moderation_reason || '').slice(0, 120),
       'transcription.processingTimeMs': Math.round((Number(res.processing_time) || 0) * 1000),
       'transcription.audioDuration':    Number(res.duration) || 0,
       'transcription.engine':           `faster-whisper:${process.env.WHISPER_MODEL || 'base'}`,
@@ -1676,14 +1685,16 @@ async function runContentAnalysis(video) {
 
     await video.save();
 
-    // Speech-to-text runs last and writes only its own sub-document, so the
-    // ranking above lands at exactly the same time it always did.
-    await runTranscription(video);
-
     return scores;
   } catch (err) {
     console.error('runContentAnalysis error:', err.message);
     return null;
+  } finally {
+    // Speech-to-text runs in its OWN error boundary, decoupled from the ranking
+    // save above — so a scoreVideo/save() failure can never skip transcription
+    // (and vice-versa). It writes only its own transcription sub-document.
+    await runTranscription(video).catch((e) =>
+      console.error('runTranscription error:', e.message));
   }
 }
 

@@ -196,8 +196,13 @@ const videoSchema = new mongoose.Schema({
   transcription: {
     text:             { type: String, default: '' },
     language:         { type: String, default: '' },
-    category:         { type: String, default: null },  // DistilBERT label
+    category:         { type: String, default: null },  // BART zero-shot label (free-form)
     confidence:       { type: Number, default: 0, min: 0, max: 1 },
+    // Text-based moderation verdict from the BART classifier policy:
+    //   'ACCEPT'  — category is in the accepted set (or Poetry ≥ threshold)
+    //   'REVIEW'  — Entertainment / low-confidence Poetry / Unknown → manual review
+    moderation:       { type: String, enum: ['ACCEPT', 'REVIEW', null], default: null },
+    moderationReason: { type: String, default: '' },
     processingTimeMs: { type: Number, default: 0 },     // end-to-end pipeline ms
     audioDuration:    { type: Number, default: 0 },     // seconds of audio
     engine:           { type: String, default: '' },    // e.g. "faster-whisper:base"

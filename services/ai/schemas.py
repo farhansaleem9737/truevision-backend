@@ -16,9 +16,16 @@ class PredictRequest(BaseModel):
 
 
 class PredictResponse(BaseModel):
-    category: str
-    confidence: float
-    all_scores: Dict[str, float]
+    # Primary category. None only for empty input; "Unknown" when the model is
+    # not confident about any label.
+    category: Optional[str] = None
+    confidence: float = 0.0
+    second_category: Optional[str] = None
+    second_confidence: float = 0.0
+    all_scores: Dict[str, float] = {}
+    # Moderation verdict from the policy: 'ACCEPT' | 'REVIEW'.
+    moderation: str = "REVIEW"
+    moderation_reason: str = ""
 
 
 # ── /recommend ───────────────────────────────────────────────────────────────
@@ -97,10 +104,15 @@ class TranscribeResponse(BaseModel):
     # (see classifier_error) — the transcript is still returned either way.
     category: Optional[str] = None
     confidence: float = 0.0
-    # Set when Whisper succeeded but DistilBERT could not classify (e.g. the
-    # trained weights are missing). Transcription is NOT failed in that case.
+    second_category: Optional[str] = None
+    second_confidence: float = 0.0
+    # Set when Whisper succeeded but the BART classifier could not run (e.g.
+    # the model failed to load). Transcription is NOT failed in that case.
     classifier_error: Optional[str] = None
     all_scores: Dict[str, float] = {}
+    # Moderation verdict from the policy: 'ACCEPT' | 'REVIEW'. Null when empty.
+    moderation: Optional[str] = None
+    moderation_reason: str = ""
     language: str = ""
     language_probability: float = 0.0
     duration: float = 0.0               # audio length in seconds

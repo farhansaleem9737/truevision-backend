@@ -17,6 +17,10 @@ router.post('/google', authController.googleSignIn);
 router.post('/2fa-verify', authController.twoFactorVerify);
 router.post('/2fa-resend', authController.twoFactorResend);
 
+// Token refresh — the refresh token authenticates itself (no Bearer). Rotates
+// the refresh token and mints a new short-lived access token.
+router.post('/refresh', authController.refresh);
+
 // SMTP diagnostic — leave mounted while you're stabilising email transport;
 // remove or guard with an admin role before going to production.
 router.get('/test-email', authController.testEmail);

@@ -7,7 +7,9 @@ uvicorn[standard]>=0.27.0
 pydantic>=2.5.0
 python-dotenv>=1.0.0
 
-# DistilBERT inference for /predict
+# Zero-shot classification for /predict (facebook/bart-large-mnli via the
+# transformers `zero-shot-classification` pipeline). Model weights (~1.6 GB)
+# auto-download to the HF cache on first load, then run locally.
 torch>=2.1.0
 transformers>=4.36.0
 

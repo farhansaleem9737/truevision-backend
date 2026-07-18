@@ -1,161 +1,215 @@
-"""DistilBERT category classifier.
+"""Zero-shot content classifier — facebook/bart-large-mnli.
 
-Loads the user-trained model from `Backend/models/truevision_model/` and
-exposes a single thread-safe `predict(text)` function. The model is loaded
-once on first use and cached for the life of the process.
+Replaces the previous DistilBERT sequence classifier. Uses the Hugging Face
+`zero-shot-classification` pipeline, which lets us score a transcript against
+an arbitrary, config-driven label set with NO fine-tuning and NO local weights
+to manage.
 
-Expected model files in the directory:
-  config.json, model.safetensors, tokenizer.json, tokenizer_config.json, vocab.txt
+The model (~1.6 GB) auto-downloads to the HuggingFace cache on first load and
+is reused from disk on every subsequent run (offline-capable thereafter). It is
+loaded exactly ONCE — a thread-safe singleton shared across all requests (see
+load() and the FastAPI lifespan) — never per request.
 
-Label mapping is read from `model.config.id2label` when present; otherwise
-falls back to the four classes the user trained against, in this order:
-  0: Educational, 1: Professional, 2: News, 3: Entertainment
+Public interface is intentionally unchanged so the API layer keeps working:
+    load()          — build the pipeline once (idempotent, thread-safe)
+    is_ready()      — bool, read-only probe for /health
+    predict(text)   — classify + apply the TrueVision moderation policy
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 from config import settings
 
 logger = logging.getLogger(__name__)
 
-# Lazy globals so the module can be imported without paying the model load
-# cost at startup. `load()` may be called explicitly during FastAPI lifespan
-# to warm them up before traffic arrives.
-_tokenizer = None
-_model = None
-_id2label: Dict[int, str] | None = None
-_device: str | None = None
+# Lazy singleton — importing this module must not pay the model-load cost.
+_pipe = None
 _lock = threading.Lock()
-
-DEFAULT_LABELS: Dict[int, str] = {
-    0: "Educational",
-    1: "Professional",
-    2: "News",
-    3: "Entertainment",
-}
+_load_error: Optional[str] = None
 
 
-def _resolve_labels(cfg_map: Dict) -> Dict[int, str]:
-    """Pick the best available label mapping.
+class ClassifierLoadError(RuntimeError):
+    """The zero-shot model could not be loaded (bad download / incompatible
+    transformers / OOM). Mapped to HTTP 503 by the API layer."""
 
-    Priority:
-      1. settings.labels       — env var TRUEVISION_LABELS (explicit override)
-      2. config.json id2label  — but only if names are meaningful (not LABEL_*)
-      3. DEFAULT_LABELS        — last-resort hard-coded fallback
-    """
-    if settings.labels:
-        return {i: name for i, name in enumerate(settings.labels)}
 
-    if cfg_map and not all(str(v).startswith("LABEL_") for v in cfg_map.values()):
-        return {int(k): v for k, v in cfg_map.items()}
+# ── Moderation policy ────────────────────────────────────────────────────────
+# ACCEPT outright. Everything else is reviewed (Entertainment always; Poetry
+# only when low-confidence; Unknown when the model isn't confident about
+# anything). Kept here — the classifier owns the decision so callers get one
+# consistent verdict.
+ACCEPT_CATEGORIES = {"Educational", "Technical", "Professional", "News", "Islamic"}
 
-    return DEFAULT_LABELS
+DECISION_ACCEPT = "ACCEPT"
+DECISION_REVIEW = "REVIEW"
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _resolve_device() -> int:
+    """HF pipeline device: 0 = first CUDA GPU, -1 = CPU."""
+    dev = settings.bart_device
+    if dev == "cpu":
+        return -1
+    if dev == "cuda":
+        return 0
+    return 0 if _cuda_available() else -1
 
 
 def load() -> None:
-    """Load tokenizer + model into memory. Idempotent and thread-safe."""
-    global _tokenizer, _model, _id2label, _device
+    """Build the zero-shot pipeline once. Idempotent and thread-safe.
 
-    if _model is not None:
+    Raises ClassifierLoadError so the caller can decide whether to degrade
+    (the lifespan logs a warning) or return 503 (/predict)."""
+    global _pipe, _load_error
+
+    if _pipe is not None:
         return
+    if _load_error is not None:
+        # Don't retry a hard failure on every request.
+        raise ClassifierLoadError(_load_error)
 
     with _lock:
-        if _model is not None:  # second check inside the lock
+        if _pipe is not None:
             return
+        if _load_error is not None:
+            raise ClassifierLoadError(_load_error)
 
-        if not settings.model_dir_exists:
-            raise FileNotFoundError(
-                f"DistilBERT model directory not found at {settings.model_dir}. "
-                "Place config.json, model.safetensors, tokenizer.json, "
-                "tokenizer_config.json, vocab.txt in this folder, or set "
-                "TRUEVISION_MODEL_DIR in your .env."
+        # Optional cache-dir override — set before importing transformers so the
+        # hub honours it. Default HF cache is used when unset (reused if the
+        # weights are already present → no re-download).
+        if settings.bart_download_root:
+            import os
+            os.environ.setdefault("HF_HOME", settings.bart_download_root)
+
+        try:
+            from transformers import pipeline  # heavy — import lazily
+        except ImportError as e:
+            _load_error = (
+                "transformers is not installed. Run: pip install transformers torch"
             )
+            raise ClassifierLoadError(_load_error) from e
 
-        # The directory can exist while holding only config/tokenizer files —
-        # that's a trained model whose *weights* were never exported. Detect it
-        # here so callers get a descriptive 503 (FileNotFoundError is mapped to
-        # 503 upstream) instead of an opaque OSError 500 from from_pretrained().
-        if not settings.model_weights_exist:
-            raise FileNotFoundError(
-                f"DistilBERT weights missing in {settings.model_dir}. Found no "
-                "model.safetensors / pytorch_model.bin — only config/tokenizer "
-                "files are present, so the trained weights were never exported. "
-                "Re-export them from your training notebook with "
-                "`model.save_pretrained('truevision_model')` and copy "
-                "model.safetensors (plus special_tokens_map.json and vocab.txt) "
-                "into this folder. Classification stays disabled until then; "
-                "transcription is unaffected."
+        device = _resolve_device()
+        logger.info(
+            "Loading zero-shot classifier '%s' (device=%s) ...",
+            settings.bart_model, "cuda" if device == 0 else "cpu",
+        )
+        try:
+            _pipe = pipeline(
+                "zero-shot-classification",
+                model=settings.bart_model,
+                device=device,
             )
+        except Exception as e:  # noqa: BLE001 — download/incompat/OOM
+            _load_error = f"Failed to load '{settings.bart_model}': {e}"
+            logger.error(_load_error)
+            raise ClassifierLoadError(_load_error) from e
 
-        # Imported lazily so that simply importing this module (e.g. for
-        # tests) doesn't drag in PyTorch.
-        import torch
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-        logger.info("Loading DistilBERT from %s ...", settings.model_dir)
-        _tokenizer = AutoTokenizer.from_pretrained(settings.model_dir)
-        _model = AutoModelForSequenceClassification.from_pretrained(settings.model_dir)
-
-        _device = "cuda" if torch.cuda.is_available() else "cpu"
-        _model.to(_device).eval()
-
-        # Resolve labels (env override > config.json > hard-coded default).
-        cfg_map = getattr(_model.config, "id2label", None) or {}
-        _id2label = _resolve_labels(cfg_map)
-
-        # Sanity check: label count should match the model's output head.
-        num_classes = getattr(_model.config, "num_labels", None) or len(_id2label)
-        if len(_id2label) != num_classes:
-            logger.warning(
-                "Label count mismatch: %d labels vs %d output classes. "
-                "Update TRUEVISION_LABELS in .env to match the model.",
-                len(_id2label), num_classes,
-            )
-
-        logger.info("DistilBERT ready on %s | labels=%s", _device, _id2label)
+        logger.info(
+            "BART zero-shot ready on %s | labels=%s",
+            "cuda" if device == 0 else "cpu", settings.zero_shot_labels,
+        )
 
 
 def is_ready() -> bool:
-    """True once the model is resident in memory. Read-only probe used by
-    /health — does not trigger a load."""
-    return _model is not None
+    """True once the model is resident. Read-only — does not trigger a load."""
+    return _pipe is not None
+
+
+def _decide(primary: str, confidence: float, all_scores: Dict[str, float]) -> Tuple[str, str, str]:
+    """Apply the moderation policy. Returns (category, decision, reason).
+
+    Order matters: the "not confident about anything" check comes first so an
+    ambiguous transcript is flagged Unknown even if some label technically
+    ranked first.
+    """
+    top = max(all_scores.values()) if all_scores else 0.0
+
+    if top < settings.unknown_threshold:
+        return "Unknown", DECISION_REVIEW, f"all-scores-below-{settings.unknown_threshold:.2f}"
+
+    if primary in ACCEPT_CATEGORIES:
+        return primary, DECISION_ACCEPT, "accepted-category"
+
+    if primary == "Entertainment":
+        return primary, DECISION_REVIEW, "entertainment-needs-review"
+
+    if primary == "Poetry":
+        if confidence < settings.poetry_threshold:
+            return primary, DECISION_REVIEW, f"poetry-below-{settings.poetry_threshold:.2f}"
+        return primary, DECISION_ACCEPT, "poetry-high-confidence"
+
+    # Any label outside the known policy set → be safe, review it.
+    return primary, DECISION_REVIEW, "uncategorized"
+
+
+def _empty_result(labels: List[str]) -> Dict:
+    return {
+        "category": None,
+        "confidence": 0.0,
+        "second_category": None,
+        "second_confidence": 0.0,
+        "all_scores": {label: 0.0 for label in labels},
+        "moderation": DECISION_REVIEW,
+        "moderation_reason": "empty-text",
+    }
 
 
 def predict(text: str) -> Dict:
-    """Run a single inference call. Returns the schema /predict expects."""
+    """Zero-shot classify `text` and apply the moderation policy.
+
+    Returns:
+      category, confidence, second_category, second_confidence, all_scores,
+      moderation ('ACCEPT' | 'REVIEW'), moderation_reason.
+    """
     load()  # cheap no-op once warm
 
-    # PyTorch is imported here too so the function works without a global
-    # import (helps when running with --reload).
-    import torch
-
+    labels = settings.zero_shot_labels
     cleaned = (text or "").strip()
     if not cleaned:
-        return {
-            "category": "Entertainment",
-            "confidence": 0.0,
-            "all_scores": {label: 0.0 for label in _id2label.values()},
-        }
+        return _empty_result(labels)
 
-    enc = _tokenizer(
+    # Bound latency on very long transcripts — BART also truncates at the token
+    # level (1024), this just caps the char count we hand it.
+    if len(cleaned) > settings.classifier_max_chars:
+        cleaned = cleaned[: settings.classifier_max_chars]
+
+    out = _pipe(
         cleaned,
-        return_tensors="pt",
-        truncation=True,
-        max_length=256,
-        padding=True,
-    ).to(_device)
+        candidate_labels=labels,
+        multi_label=False,  # scores are softmaxed across labels → sum to 1
+        hypothesis_template=settings.hypothesis_template,
+    )
 
-    with torch.no_grad():
-        logits = _model(**enc).logits[0]
-        probs = torch.softmax(logits, dim=-1).cpu().tolist()
+    # Pipeline returns labels + scores already sorted high → low.
+    ranked_labels: List[str] = out["labels"]
+    ranked_scores: List[float] = [float(s) for s in out["scores"]]
+    all_scores = {label: score for label, score in zip(ranked_labels, ranked_scores)}
 
-    top = max(range(len(probs)), key=lambda i: probs[i])
+    primary = ranked_labels[0]
+    confidence = ranked_scores[0]
+    second = ranked_labels[1] if len(ranked_labels) > 1 else None
+    second_conf = ranked_scores[1] if len(ranked_scores) > 1 else 0.0
+
+    category, decision, reason = _decide(primary, confidence, all_scores)
+
     return {
-        "category": _id2label.get(top, str(top)),
-        "confidence": float(probs[top]),
-        "all_scores": {_id2label.get(i, str(i)): float(probs[i]) for i in range(len(probs))},
+        "category": category,
+        "confidence": confidence,
+        "second_category": second,
+        "second_confidence": second_conf,
+        "all_scores": all_scores,
+        "moderation": decision,
+        "moderation_reason": reason,
     }

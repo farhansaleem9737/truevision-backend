@@ -21,13 +21,6 @@ class Settings:
     def __init__(self) -> None:
         here = Path(__file__).resolve().parent
 
-        # ── Model paths ────────────────────────────────────────────────────
-        # Default: Backend/models/truevision_model/  (relative to this file)
-        default_model_dir = here.parent.parent / "models" / "truevision_model"
-        self.model_dir: str = os.environ.get(
-            "TRUEVISION_MODEL_DIR", str(default_model_dir)
-        )
-
         # FAQ knowledge base (used by /chatbot)
         self.faq_path: str = os.environ.get(
             "TRUEVISION_FAQ_PATH", str(here / "data" / "faqs.json")
@@ -39,15 +32,42 @@ class Settings:
             "CHATBOT_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
         )
 
-        # Override the DistilBERT class labels. The user-supplied
-        # truevision_model/config.json has generic LABEL_0..LABEL_3 entries,
-        # so we map indices → human names here. Order MUST match the order
-        # the model was trained against. Comma-separated, no spaces required.
+        # ── Zero-shot classifier (facebook/bart-large-mnli) ────────────────
+        # HF model id for /predict. Auto-downloads (~1.6 GB) to the HF cache on
+        # first load, then runs locally/offline and is reused if already cached.
+        self.bart_model: str = os.environ.get("BART_MODEL", "facebook/bart-large-mnli")
+
+        # "auto" → CUDA when available else CPU. Force with "cpu" / "cuda".
+        self.bart_device: str = os.environ.get("BART_DEVICE", "auto")
+
+        # Optional HF cache dir override for the weights. Blank = default cache.
+        self.bart_download_root: str = os.environ.get("BART_DOWNLOAD_ROOT", "").strip()
+
+        # Candidate labels the zero-shot head scores every transcript against.
         raw_labels = os.environ.get(
-            "TRUEVISION_LABELS",
-            "Educational,Professional,News,Entertainment",
+            "CLASSIFIER_LABELS",
+            "Educational,Technical,Professional,News,Entertainment,Islamic,Poetry",
         )
-        self.labels: list[str] = [s.strip() for s in raw_labels.split(",") if s.strip()]
+        self.zero_shot_labels: list[str] = [s.strip() for s in raw_labels.split(",") if s.strip()]
+
+        # NLI hypothesis template; "{}" is filled with each candidate label.
+        self.hypothesis_template: str = os.environ.get(
+            "CLASSIFIER_HYPOTHESIS", "This text is about {}."
+        )
+
+        # Cap transcript length (chars) fed to the classifier. BART also
+        # truncates at the token level — this just bounds latency.
+        self.classifier_max_chars: int = int(os.environ.get("CLASSIFIER_MAX_CHARS", "4000"))
+
+        # ── Moderation thresholds ──────────────────────────────────────────
+        # Top score below this → "Unknown" + manual review.
+        self.unknown_threshold: float = float(
+            os.environ.get("CLASSIFIER_UNKNOWN_THRESHOLD", "0.45")
+        )
+        # Poetry is accepted only at/above this confidence, else sent for review.
+        self.poetry_threshold: float = float(
+            os.environ.get("CLASSIFIER_POETRY_THRESHOLD", "0.70")
+        )
 
         # ── HTTP server ────────────────────────────────────────────────────
         self.host: str = os.environ.get("AI_HOST", "0.0.0.0")
@@ -104,22 +124,6 @@ class Settings:
 
         # Max size for an uploaded/downloaded video accepted by /transcribe (MB).
         self.max_video_mb: int = int(os.environ.get("MAX_VIDEO_MB", "500"))
-
-    @property
-    def model_dir_exists(self) -> bool:
-        return Path(self.model_dir).is_dir()
-
-    @property
-    def model_weights_exist(self) -> bool:
-        """True when the DistilBERT *weights* are present — not just the dir.
-
-        from_pretrained() needs one of these; a folder with only config.json +
-        tokenizer files will fail to load, so /health surfaces this distinctly.
-        """
-        d = Path(self.model_dir)
-        return any((d / f).is_file() for f in (
-            "model.safetensors", "pytorch_model.bin", "tf_model.h5", "model.onnx",
-        ))
 
 
 settings = Settings()

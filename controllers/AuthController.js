@@ -6,6 +6,7 @@ const { sendVerificationEmail, sendPasswordResetEmail, sendTestEmail,
         sendSecurityOtpEmail, sendSecurityAlertEmail } = require('../services/emailService');
 const cloudinary = require('../config/cloudinary');
 const sessionTracker = require('../services/sessionTracker');
+const refreshTokens  = require('../services/refreshTokens');
 
 // One client per process — used to verify ID tokens issued by Google.
 // We accept tokens minted for any of the three OAuth client IDs we register
@@ -18,11 +19,45 @@ const GOOGLE_AUDIENCES = [
 
 const googleClient = new OAuth2Client();
 
-// Generate JWT token
+// Generate the short-lived ACCESS token. Kept as a small helper so every mint
+// site produces identical tokens. The refresh token (services/refreshTokens.js)
+// silently mints new access tokens, so this TTL can be short without logging
+// active users out. Verification in middleware/Auth.js is UNCHANGED.
 const generateToken = (userId) => {
   return jwt.sign({ userId }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRES_IN || '30d'
+    expiresIn: process.env.ACCESS_TOKEN_TTL || '1h',
   });
+};
+
+// Canonical public user payload — the exact shape the client reads from
+// `data.user` at every auth entry point (login/verify/2fa/google/refresh).
+const publicUser = (user) => ({
+  _id:          user._id,
+  fullName:     user.fullName,
+  username:     user.username,
+  email:        user.email,
+  country:      user.country,
+  profileImage: user.profileImage,
+  role:         user.role,
+  isVerified:   user.isVerified,
+  createdAt:    user.createdAt,
+});
+
+// Mint an access token AND a rotating refresh token for a freshly-authenticated
+// session, then build the standard { token, refreshToken, user } data envelope.
+// Backward-compatible: old clients simply ignore the extra `refreshToken`.
+const buildSession = async (user, { req, method } = {}) => {
+  const token = generateToken(user._id);
+  let refreshToken = null;
+  try {
+    const sessionIat = jwt.decode(token)?.iat ?? null;
+    refreshToken = await refreshTokens.issue(user, { sessionIat, req });
+  } catch (e) {
+    // Never block sign-in if the refresh row can't be written — the access
+    // token still works; the client just won't have silent refresh this session.
+    console.error('[auth] refresh issue failed:', e.message);
+  }
+  return { token, refreshToken, user: publicUser(user) };
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -226,27 +261,14 @@ exports.verifyEmail = async (req, res) => {
     user.lastLogin = new Date();
     await user.save();
 
-    // Generate token
-    const token = generateToken(user._id);
-    sessionTracker.recordLogin(req, user, token, 'email-verify').catch(() => {});
+    // Mint access + rotating refresh token.
+    const session = await buildSession(user, { req, method: 'email-verify' });
+    sessionTracker.recordLogin(req, user, session.token, 'email-verify').catch(() => {});
 
     res.status(200).json({
       success: true,
       message: 'Email verified successfully!',
-      data: {
-        token,
-        user: {
-          _id: user._id,
-          fullName: user.fullName,
-          username: user.username,
-          email: user.email,
-          country: user.country,
-          profileImage: user.profileImage,
-          role: user.role,
-          isVerified: user.isVerified,
-          createdAt: user.createdAt
-        }
-      }
+      data: session,
     });
   } catch (error) {
     console.error('Verification error:', error);
@@ -390,19 +412,19 @@ exports.login = async (req, res) => {
     user.lastLogin = new Date();
     await user.save();
 
-    // Generate token
-    const token = generateToken(user._id);
+    // Mint access + rotating refresh token for the new session.
+    const session = await buildSession(user, { req, method: 'password' });
 
     // Login-activity row + optional new-login security alert (fire-and-forget).
-    sessionTracker.recordLogin(req, user, token, 'password').then((session) => {
+    sessionTracker.recordLogin(req, user, session.token, 'password').then((s) => {
       const alertsOn = user.preferences?.notifications?.emailSecurity !== false;
-      if (alertsOn && session) {
-        const where = [session.city, session.country].filter(Boolean).join(', ') || 'Unknown location';
+      if (alertsOn && s) {
+        const where = [s.city, s.country].filter(Boolean).join(', ') || 'Unknown location';
         sendSecurityAlertEmail(user.email, user.fullName, {
           title: 'New sign-in to your TrueVision account',
           lines: [
-            `Device: ${session.deviceName || 'Unknown device'} (${session.deviceOS || 'unknown OS'})`,
-            `Location: ${where}${session.ip ? ` — IP ${session.ip}` : ''}`,
+            `Device: ${s.deviceName || 'Unknown device'} (${s.deviceOS || 'unknown OS'})`,
+            `Location: ${where}${s.ip ? ` — IP ${s.ip}` : ''}`,
             `When: ${new Date().toUTCString()}`,
           ],
         }).catch(() => {});
@@ -412,20 +434,7 @@ exports.login = async (req, res) => {
     res.status(200).json({
       success: true,
       message: 'Login successful!',
-      data: {
-        token,
-        user: {
-          _id: user._id,
-          fullName: user.fullName,
-          username: user.username,
-          email: user.email,
-          country: user.country,
-          profileImage: user.profileImage,
-          role: user.role,
-          isVerified: user.isVerified,
-          createdAt: user.createdAt
-        }
-      }
+      data: session,
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -470,26 +479,13 @@ exports.twoFactorVerify = async (req, res) => {
     user.lastLogin = new Date();
     await user.save();
 
-    const token = generateToken(user._id);
-    sessionTracker.recordLogin(req, user, token, '2fa').catch(() => {});
+    const session = await buildSession(user, { req, method: '2fa' });
+    sessionTracker.recordLogin(req, user, session.token, '2fa').catch(() => {});
 
     return res.status(200).json({
       success: true,
       message: 'Login successful!',
-      data: {
-        token,
-        user: {
-          _id: user._id,
-          fullName: user.fullName,
-          username: user.username,
-          email: user.email,
-          country: user.country,
-          profileImage: user.profileImage,
-          role: user.role,
-          isVerified: user.isVerified,
-          createdAt: user.createdAt,
-        },
-      },
+      data: session,
     });
   } catch (error) {
     console.error('twoFactorVerify error:', error);
@@ -665,26 +661,13 @@ exports.googleSignIn = async (req, res) => {
     user.lastLogin = new Date();
     await user.save();
 
-    const token = generateToken(user._id);
-    sessionTracker.recordLogin(req, user, token, 'google').catch(() => {});
+    const session = await buildSession(user, { req, method: 'google' });
+    sessionTracker.recordLogin(req, user, session.token, 'google').catch(() => {});
 
     return res.status(200).json({
       success: true,
       message: isNew ? 'Account created with Google' : 'Signed in with Google',
-      data: {
-        token,
-        user: {
-          _id:          user._id,
-          fullName:     user.fullName,
-          username:     user.username,
-          email:        user.email,
-          country:      user.country,
-          profileImage: user.profileImage,
-          role:         user.role,
-          isVerified:   user.isVerified,
-          createdAt:    user.createdAt,
-        },
-      },
+      data: session,
     });
   } catch (err) {
     console.error('googleSignIn error:', err);
@@ -858,6 +841,9 @@ exports.resetPassword = async (req, res) => {
         { $set: { revokedAt: new Date() } },
       ).catch(() => {});
     } catch (_) { /* best-effort */ }
+    // Refresh tokens die with the access tokens — otherwise a leaked refresh
+    // token would silently re-mint access after the reset.
+    refreshTokens.revokeAllForUser(user._id).catch(() => {});
 
     res.status(200).json({
       success: true,
@@ -959,10 +945,77 @@ exports.logout = async (req, res) => {
     if (req.authToken) await revokeToken(req.authToken);
     // Close the LoginSession row for this device (Security → Login Activity).
     sessionTracker.recordLogout(req.user?._id, req.tokenIat).catch(() => {});
+    // Revoke this device's refresh-token family so it can't re-mint access.
+    // The client sends its refreshToken in the body; if absent (old client),
+    // the access-token revocation above still applies.
+    if (req.body?.refreshToken) {
+      refreshTokens.revokeByRaw(req.body.refreshToken).catch(() => {});
+    }
     return res.status(200).json({ success: true, message: 'Signed out.' });
   } catch (err) {
     console.error('logout error:', err);
     return res.status(200).json({ success: true, message: 'Signed out.' });
+  }
+};
+
+// @desc    Exchange a refresh token for a new access + refresh token (rotation)
+// @route   POST /api/auth/refresh
+// @access  Public — the refresh token authenticates itself (no Bearer needed).
+//
+// Backward-compatible: returns the SAME { token, refreshToken, user } envelope
+// the login routes use, so the client's normal session handling applies. On any
+// failure it returns 401 with a coded reason so the client logs out gracefully
+// (never a refresh loop — the client marks retried requests).
+exports.refresh = async (req, res) => {
+  try {
+    const { refreshToken } = req.body || {};
+    if (!refreshToken) {
+      return res.status(400).json({ success: false, code: 'REFRESH_MISSING', message: 'Refresh token required.' });
+    }
+
+    let rotated;
+    try {
+      rotated = await refreshTokens.rotate(refreshToken, { req });
+    } catch (e) {
+      // REFRESH_INVALID | REFRESH_EXPIRED | REFRESH_REUSED → force re-login.
+      return res.status(401).json({
+        success: false,
+        code:    e.code || 'REFRESH_INVALID',
+        message: 'Your session has expired. Please sign in again.',
+      });
+    }
+
+    const user = await User.findById(rotated.userId);
+    if (!user) {
+      // Orphaned refresh family — clean it up and force re-login.
+      refreshTokens.revokeFamily(rotated.familyId).catch(() => {});
+      return res.status(401).json({ success: false, code: 'USER_NOT_FOUND', message: 'Account not found.' });
+    }
+
+    // Global cutoff guard: a logout-all / password change sets tokenInvalidBefore
+    // AND revokes refresh families, so rotate() would normally already have
+    // failed — this is a defensive double-check.
+    if (user.tokenInvalidBefore && rotated.sessionIat &&
+        rotated.sessionIat * 1000 < new Date(user.tokenInvalidBefore).getTime()) {
+      refreshTokens.revokeFamily(rotated.familyId).catch(() => {});
+      return res.status(401).json({ success: false, code: 'TOKEN_NOT_ACTIVE', message: 'Session ended. Please sign in again.' });
+    }
+
+    const accessToken = generateToken(user._id);
+    // Keep Login-Activity honest — bump last-active for this session lineage.
+    if (rotated.sessionIat) sessionTracker.touchSession(user._id, rotated.sessionIat).catch(() => {});
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        token:        accessToken,
+        refreshToken: rotated.refreshToken,
+        user:         publicUser(user),
+      },
+    });
+  } catch (err) {
+    console.error('refresh error:', err);
+    return res.status(500).json({ success: false, message: 'Could not refresh session.' });
   }
 };
 

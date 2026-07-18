@@ -22,9 +22,16 @@ const appRoutes          = require("./routes/AppRoutes");
 const legalRoutes        = require("./routes/LegalRoutes");
 const supportRoutes      = require("./routes/SupportRoutes");
 const { initSocket } = require("./socket");
+const mongoose = require("mongoose");
+const aiClient = require("./services/aiClient");
 
 const app    = express();
 const server = http.createServer(app);
+
+// Trust the first proxy hop so req.ip / rate-limit keys reflect the real client
+// IP behind a reverse proxy or load balancer (otherwise every client collapses
+// to the proxy IP → shared rate-limit bucket + wrong CORS/log IPs).
+app.set("trust proxy", 1);
 
 // Connect to MongoDB
 connectDB();
@@ -108,11 +115,19 @@ app.use("/api/legal",         rateLimit(120, 60 * 1000,      'legal'),        le
 // Support: FAQs are public; ticket writes are tighter to deter spam.
 app.use("/api/support",       rateLimit(60,  60 * 1000,      'support'),      supportRoutes);
 
-// Health check
-app.get("/health", (req, res) => {
+// Health check — aggregates DB state + the AI microservice's model readiness so
+// one call reports the whole pipeline. ai.health() degrades to {status:'down'}
+// on an AI outage (never throws), so this endpoint always responds cleanly.
+app.get("/health", async (req, res) => {
+  const aiHealth = await aiClient.health();
   res.status(200).json({
-    status: "OK",
-    message: "Server is running",
+    status:           "OK",
+    mongodb_connected: mongoose.connection.readyState === 1,
+    nudenet_loaded:    !!aiHealth.nudenet_loaded,
+    whisper_loaded:    !!aiHealth.whisper_loaded,
+    bart_loaded:       !!aiHealth.bart_loaded,
+    ffmpeg_available:  !!aiHealth.ffmpeg_available,
+    ai_service:        aiHealth.status || "down",
   });
 });
 

@@ -148,7 +148,7 @@ const chat = (message, history = []) =>
 //
 // Full speech pipeline in one call: the AI service downloads the video, pulls
 // the audio with FFmpeg, transcribes it with Faster-Whisper, then feeds the
-// transcript to the SAME DistilBERT classifier /predict uses.
+// transcript to the SAME zero-shot classifier (BART) that /predict uses.
 //
 // Returns: { transcript, category, confidence, all_scores, language,
 //            duration, processing_time, empty, segments }

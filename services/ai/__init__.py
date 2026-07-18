@@ -1,7 +1,8 @@
 """TrueVision AI microservice package.
 
-Bundles four endpoints behind a single FastAPI app:
-  POST /predict     — DistilBERT category classification
+Bundles the endpoints behind a single FastAPI app:
+  POST /predict     — zero-shot category classification (facebook/bart-large-mnli)
+  POST /transcribe  — FFmpeg → Whisper → BART speech-to-classification
   POST /recommend   — educational-first ranking
   POST /moderate    — NudeNet NSFW detection
   POST /chatbot     — sentence-transformers FAQ retrieval

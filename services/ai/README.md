@@ -13,8 +13,9 @@ React Native  →  Node /api/ai/*  →  FastAPI :8001  →  models (local)
 
 | Verb | Path        | What it does                                                    |
 |------|-------------|-----------------------------------------------------------------|
-| GET  | `/health`   | Liveness probe + reports whether the DistilBERT folder is present |
-| POST | `/predict`  | Classifies text/captions into Educational / Professional / News / Entertainment |
+| GET  | `/health`   | Liveness probe + reports whisper_loaded / bart_loaded / nudenet_loaded |
+| POST | `/predict`  | Zero-shot classifies text into Educational / Technical / Professional / News / Entertainment / Islamic / Poetry (facebook/bart-large-mnli) |
+| POST | `/transcribe`| FFmpeg → Whisper → BART: video/audio → transcript + category + moderation |
 | POST | `/recommend`| Re-ranks a batch of candidate videos with an educational-first bias |
 | POST | `/moderate` | Runs NudeNet over one image URL or a list of frame URLs         |
 | POST | `/chatbot`  | FAQ retrieval over a curated knowledge base                      |
@@ -23,20 +24,15 @@ React Native  →  Node /api/ai/*  →  FastAPI :8001  →  models (local)
 
 ```
 Backend/
-├── models/
-│   └── truevision_model/        ← drop your DistilBERT files here
-│       ├── config.json
-│       ├── model.safetensors
-│       ├── tokenizer.json
-│       ├── tokenizer_config.json
-│       └── vocab.txt
 └── services/
     ├── ai/                      ← this microservice
     │   ├── __init__.py
     │   ├── main.py              ← FastAPI app + routes
     │   ├── config.py            ← env-driven settings
     │   ├── schemas.py           ← Pydantic request/response models
-    │   ├── classifier.py        ← /predict — DistilBERT
+    │   ├── classifier.py        ← /predict — BART zero-shot (facebook/bart-large-mnli)
+    │   ├── whisper.py           ← /transcribe — Faster-Whisper speech-to-text
+    │   ├── ffmpeg_utils.py      ← /transcribe — audio extraction
     │   ├── moderator.py         ← /moderate — NudeNet
     │   ├── recommender.py       ← /recommend — heuristic scorer
     │   ├── chatbot.py           ← /chatbot — FAQ retrieval
@@ -52,11 +48,12 @@ Backend/
 
 ## Installation
 
-**Prerequisites**: Python 3.10+ and Node.js 18+.
+**Prerequisites**: Python 3.10+, Node.js 18+, and FFmpeg on PATH (for `/transcribe`).
 
-**1. Drop the model files** into `Backend/models/truevision_model/`. The
-folder must contain `config.json`, `model.safetensors`, `tokenizer.json`,
-`tokenizer_config.json`, and `vocab.txt`.
+**1. Models download automatically.** The BART zero-shot classifier
+(`facebook/bart-large-mnli`, ~1.6 GB) and the Whisper `base` model (~140 MB)
+are fetched to the HuggingFace cache on first run and reused offline afterwards
+— nothing to drop in manually.
 
 **2. Create the env file** (optional — defaults work for local dev):
 
@@ -100,7 +97,8 @@ The first time you hit each endpoint, supporting models auto-download:
 
 | Endpoint     | What downloads                    | Approx size |
 |--------------|-----------------------------------|-------------|
-| `/predict`   | Nothing — uses your local files   | 0           |
+| `/predict`   | `facebook/bart-large-mnli` from HuggingFace | ~1.6 GB |
+| `/transcribe`| Whisper `base` (+ reuses BART above) | ~140 MB  |
 | `/moderate`  | NudeNet weights                   | ~80 MB      |
 | `/chatbot`   | `all-MiniLM-L6-v2` from HuggingFace | ~80 MB    |
 | `/recommend` | Nothing — pure heuristic          | 0           |
@@ -119,13 +117,12 @@ Response:
 ```json
 {
   "category": "Educational",
-  "confidence": 0.97,
-  "all_scores": {
-    "Educational": 0.97,
-    "Professional": 0.02,
-    "News": 0.005,
-    "Entertainment": 0.005
-  }
+  "confidence": 0.94,
+  "second_category": "Technical",
+  "second_confidence": 0.04,
+  "all_scores": { "Educational": 0.94, "Technical": 0.04, "...": 0.0 },
+  "moderation": "ACCEPT",
+  "moderation_reason": "accepted-category"
 }
 ```
 
@@ -232,6 +229,6 @@ exact call shapes Node uses.
   Without it the service is open on its port.
 - **CORS**: replace `*` with explicit origins for prod.
 - **Workers**: for higher throughput run uvicorn with `--workers 2` (each
-  worker loads its own DistilBERT — ~250 MB per worker).
+  worker loads its own BART + Whisper — budget ~2.5 GB RAM per worker).
 - **Don't expose FastAPI publicly**: keep it bound to `127.0.0.1` or behind
   a private network. Public traffic always goes through Node.

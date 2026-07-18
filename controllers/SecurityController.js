@@ -105,6 +105,9 @@ exports.changePassword = async (req, res) => {
       { userId: user._id, revokedAt: null, logoutAt: null },
       { $set: { revokedAt: new Date() } },
     ).catch(() => {});
+    // Revoke all refresh tokens too — a changed password must not leave a
+    // refresh token able to silently re-mint access.
+    require('../services/refreshTokens').revokeAllForUser(user._id).catch(() => {});
 
     alertIfEnabled(user, {
       title: 'Your TrueVision password was changed',
@@ -430,17 +433,27 @@ exports.logoutAll = async (req, res) => {
       { userId: user._id, revokedAt: null, logoutAt: null },
       { $set: { revokedAt: new Date() } },
     );
+    // Revoke every refresh-token family too — this IS "log out everywhere".
+    const refreshTokens = require('../services/refreshTokens');
+    await refreshTokens.revokeAllForUser(user._id).catch(() => {});
 
     let freshToken = null;
+    let freshRefreshToken = null;
     if (keepCurrent) {
       // Sign after the cutoff (iat resolution is seconds — wait out the edge).
       await new Promise((r) => setTimeout(r, 1100));
       const jwt = require('jsonwebtoken');
       freshToken = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, {
-        expiresIn: process.env.JWT_EXPIRES_IN || '30d',
+        expiresIn: process.env.ACCESS_TOKEN_TTL || '1h',
       });
       const sessionTracker = require('../services/sessionTracker');
       await sessionTracker.recordLogin(req, user, freshToken, 'password');
+      // Issue a brand-new refresh family for the device that stayed in.
+      try {
+        freshRefreshToken = await refreshTokens.issue(user, {
+          sessionIat: jwt.decode(freshToken)?.iat ?? null, req,
+        });
+      } catch (_) { /* access token still works without silent refresh */ }
     }
 
     alertIfEnabled(user, {
@@ -456,6 +469,7 @@ exports.logoutAll = async (req, res) => {
         ? 'All other devices were signed out.'
         : 'Signed out everywhere. Please sign in again.',
       ...(freshToken ? { token: freshToken } : {}),
+      ...(freshRefreshToken ? { refreshToken: freshRefreshToken } : {}),
     });
   } catch (err) {
     console.error('logoutAll error:', err);

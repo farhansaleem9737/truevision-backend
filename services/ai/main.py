@@ -10,10 +10,11 @@ or from inside this folder:
 
 Endpoints:
   GET  /health     — liveness probe
-  POST /predict    — DistilBERT category classifier
+  POST /predict    — zero-shot category classifier (facebook/bart-large-mnli)
   POST /recommend  — educational-first ranking
   POST /moderate   — NudeNet NSFW detection
   POST /chatbot    — sentence-transformers FAQ retrieval
+  POST /transcribe — FFmpeg → Whisper → BART speech-to-classification
 """
 
 from __future__ import annotations
@@ -66,19 +67,17 @@ logger = logging.getLogger("truevision.ai")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Warm up DistilBERT + Faster-Whisper on startup so the first request
-    isn't cold, and so both models are loaded exactly ONCE per process and
-    reused for every request. NudeNet, sentence-transformers and the
+    """Warm up the BART zero-shot classifier + Faster-Whisper on startup so the
+    first request isn't cold, and so each model is loaded exactly ONCE per
+    process and reused for every request. NudeNet, sentence-transformers and the
     recommender stay lazy — they pay their load cost on first hit."""
     try:
         await run_in_threadpool(classifier.load)
-        logger.info("DistilBERT pre-warmed.")
-    except FileNotFoundError as e:
-        # Don't crash the service if the model dir is missing — /predict
-        # will return 503 until the user drops the files in.
-        logger.warning("DistilBERT not loaded: %s", e)
-    except Exception as e:  # noqa: BLE001 — e.g. weights absent from the dir
-        logger.warning("DistilBERT not loaded: %s", e)
+        logger.info("BART zero-shot classifier pre-warmed (%s).", settings.bart_model)
+    except Exception as e:  # noqa: BLE001 — download/incompat/OOM
+        # Don't crash the service — /predict returns 503 and /transcribe still
+        # returns the transcript with classifier_error until this recovers.
+        logger.warning("BART not loaded: %s", e)
 
     # Whisper downloads its weights on first load; do it at startup so no user
     # request pays for it. A failure here is non-fatal — /transcribe 503s.
@@ -91,6 +90,16 @@ async def lifespan(app: FastAPI):
     if not ffmpeg_utils.ffmpeg_available():
         logger.warning("FFmpeg not on PATH — /transcribe will return 503.")
 
+    # Pre-warm NudeNet so the moderation stage is hot from the first upload and
+    # /health reports nudenet_loaded. This calls moderator's existing lazy
+    # loader — NudeNet's own module is unchanged. Non-fatal: /moderate degrades
+    # to SAFE on any error regardless.
+    try:
+        await run_in_threadpool(moderator._get_detector)
+        logger.info("NudeNet pre-warmed.")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("NudeNet not loaded: %s", e)
+
     yield
     logger.info("Shutdown complete.")
 
@@ -98,7 +107,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="TrueVision AI Service",
     version="1.0.0",
-    description="DistilBERT classifier + NudeNet moderation + FAQ chatbot + recommender.",
+    description="BART zero-shot classifier + NudeNet moderation + Whisper transcription + FAQ chatbot + recommender.",
     lifespan=lifespan,
 )
 
@@ -132,19 +141,22 @@ async def require_api_key(request: Request):
 
 @app.get("/health", tags=["meta"])
 def health():
+    # NudeNet is lazy by design (loads on first /moderate) — we read its
+    # detector singleton without importing/loading it, so this reflects real
+    # state without changing NudeNet's behaviour.
+    nudenet_loaded = getattr(moderator, "_detector", None) is not None
     return {
         "status": "ok",
-        "model_dir_present": settings.model_dir_exists,
-        # Distinguishes "folder exists" from "weights actually present" —
-        # a dir with only config/tokenizer files cannot load.
-        "model_weights_present": settings.model_weights_exist,
-        "distilbert_loaded": classifier.is_ready(),
-        "model_dir": settings.model_dir,
-        # Transcription pipeline readiness.
+        # ── Pipeline model readiness ──
+        "whisper_loaded": whisper.is_ready(),
+        "bart_loaded": classifier.is_ready(),
+        "nudenet_loaded": nudenet_loaded,
+        # ── Detail ──
+        "bart_model": settings.bart_model,
+        "candidate_labels": settings.zero_shot_labels,
+        "whisper_model": settings.whisper_model,
         "ffmpeg_available": ffmpeg_utils.ffmpeg_available(),
         "ffmpeg_version": ffmpeg_utils.ffmpeg_version(),
-        "whisper_model": settings.whisper_model,
-        "whisper_loaded": whisper.is_ready(),
     }
 
 
@@ -154,7 +166,8 @@ async def predict(req: PredictRequest) -> PredictResponse:
         # Inference is CPU-bound — push it to a worker thread.
         result = await run_in_threadpool(classifier.predict, req.text)
         return PredictResponse(**result)
-    except FileNotFoundError as e:
+    except classifier.ClassifierLoadError as e:
+        # Model couldn't load (download failure / OOM) → not ready.
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:  # noqa: BLE001
         logger.exception("/predict failed")
@@ -190,8 +203,8 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
 # ── /transcribe ─────────────────────────────────────────────────────────────
 #
-# Pipeline:  video → FFmpeg (audio.wav) → Faster-Whisper (text) → DistilBERT
-#            (category + confidence) → JSON
+# Pipeline:  video → FFmpeg (audio.wav) → Faster-Whisper (text) → BART zero-shot
+#            (category + confidence + moderation) → JSON
 #
 # Accepts EITHER:
 #   • multipart/form-data with `file` (raw video bytes), or
@@ -280,16 +293,16 @@ async def transcribe(
                 video_id=video_id,
             )
 
-        # 5. Existing DistilBERT classifier — unchanged, just fed the transcript.
-        #    If the classifier is unavailable (e.g. weights were never exported)
-        #    we still return the transcript: Whisper's work is independently
-        #    valuable and must not be discarded because of a downstream gap.
-        #    /predict remains the endpoint that hard-503s in that situation.
+        # 5. BART zero-shot classifier — fed the transcript.
+        #    If the classifier is unavailable (model failed to load) we still
+        #    return the transcript: Whisper's work is independently valuable and
+        #    must not be discarded because of a downstream gap. /predict remains
+        #    the endpoint that hard-503s in that situation.
         prediction: dict = {}
         classifier_error: Optional[str] = None
         try:
             prediction = await run_in_threadpool(classifier.predict, transcript)
-        except Exception as e:  # noqa: BLE001 — missing weights, OOM, etc.
+        except Exception as e:  # noqa: BLE001 — model load failure, OOM, etc.
             classifier_error = str(e)
             logger.warning("Classification skipped: %s", e)
 
@@ -297,7 +310,11 @@ async def transcribe(
             transcript=transcript,
             category=prediction.get("category"),
             confidence=float(prediction.get("confidence", 0.0)),
+            second_category=prediction.get("second_category"),
+            second_confidence=float(prediction.get("second_confidence", 0.0)),
             all_scores=prediction.get("all_scores", {}),
+            moderation=prediction.get("moderation"),
+            moderation_reason=prediction.get("moderation_reason", ""),
             classifier_error=classifier_error,
             language=result.get("language", ""),
             language_probability=result.get("language_probability", 0.0),
@@ -323,9 +340,6 @@ async def transcribe(
     except ffmpeg_utils.CorruptVideoError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except whisper.WhisperLoadError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except FileNotFoundError as e:
-        # DistilBERT model dir/weights missing.
         raise HTTPException(status_code=503, detail=str(e))
     except HTTPException:
         raise

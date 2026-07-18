@@ -9,7 +9,7 @@
   },
   {
     "question": "How does TrueVision categorize videos?",
-    "answer": "Every upload is run through a DistilBERT classifier that assigns one of four categories: Educational, Professional, News, or Entertainment. The category drives ranking and recommendations."
+    "answer": "We transcribe each video's speech and run the transcript through a zero-shot classifier that scores it across categories such as Educational, Technical, Professional, News, Entertainment, Islamic, and Poetry. The category drives ranking, recommendations, and moderation."
   },
   {
     "question": "How does the recommendation feed work?",
