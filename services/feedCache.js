@@ -60,11 +60,24 @@ const invalidateUserFeed = (userId) => {
   return cache.invalidateScope(feedRegistryKey(userId), [foryouPoolKey(userId)]);
 };
 
+/**
+ * Invalidate EVERY viewer's public feed + personalized pools. Use when a video's
+ * public visibility changes for everyone — a new approved upload, an admin
+ * approve/reject/delete, a block/unblock — so the change is reflected on the
+ * next feed fetch instead of after the TTL. SCAN-based (safe on large keyspaces);
+ * best-effort and non-blocking.
+ */
+const invalidatePublicFeeds = () => {
+  cache.delByPrefix('video:feed:*').catch(() => {});
+  cache.delByPrefix('video:foryou:pool:*').catch(() => {});
+};
+
 module.exports = {
   FEED_TTL_SECONDS,
   RECOMMENDATION_KEYS,
   affectsRecommendations,
   trackUserFeedKey,
   invalidateUserFeed,
+  invalidatePublicFeeds,
   foryouPoolKey,
 };

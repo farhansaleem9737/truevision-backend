@@ -21,6 +21,7 @@ const settingsRoutes     = require("./routes/SettingsRoutes");
 const appRoutes          = require("./routes/AppRoutes");
 const legalRoutes        = require("./routes/LegalRoutes");
 const supportRoutes      = require("./routes/SupportRoutes");
+const adminRoutes        = require("./routes/AdminRoutes");
 const { initSocket } = require("./socket");
 const mongoose = require("mongoose");
 const aiClient = require("./services/aiClient");
@@ -36,6 +37,13 @@ app.set("trust proxy", 1);
 // Connect to MongoDB
 connectDB();
 
+// Seed the moderation-panel admin from ADMIN_USERNAME/ADMIN_PASSWORD once Mongo
+// is connected (no-op if those env vars aren't set). See services/adminSeed.js.
+const seedAdminWhenReady = () =>
+  require('./services/adminSeed').seedAdmin().catch((e) => console.error('[adminSeed]', e.message));
+if (mongoose.connection.readyState === 1) seedAdminWhenReady();
+else mongoose.connection.once('connected', seedAdminWhenReady);
+
 // Middleware
 // ── Security headers ──────────────────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -47,6 +55,9 @@ app.use((req, res, next) => {
 });
 
 // ── CORS — flexible for dev, strict for prod ────────────────────────────────
+// TODO (production): this already restricts to FRONTEND_URL when
+// NODE_ENV==='production' — verify FRONTEND_URL is set to the real deployed
+// origin before release. Development intentionally allows localhost/LAN.
 const IS_PROD = process.env.NODE_ENV === 'production';
 
 app.use(
@@ -114,6 +125,9 @@ app.use("/api/app",           rateLimit(120, 60 * 1000,      'app'),          ap
 app.use("/api/legal",         rateLimit(120, 60 * 1000,      'legal'),        legalRoutes);
 // Support: FAQs are public; ticket writes are tighter to deter spam.
 app.use("/api/support",       rateLimit(60,  60 * 1000,      'support'),      supportRoutes);
+// Admin moderation panel — hidden, admin-JWT only. AdminRoutes has its own
+// per-route rate limiters (strict on login), so no mount-level limiter here.
+app.use("/api/admin",         adminRoutes);
 
 // Health check — aggregates DB state + the AI microservice's model readiness so
 // one call reports the whole pipeline. ai.health() degrades to {status:'down'}
@@ -140,10 +154,17 @@ app.use((err, req, res, next) => {
   });
 });
 
-// ── Boot-time SMTP config visibility ────────────────────────────────────────
-// Doesn't open a connection — only prints whether EMAIL_USER / EMAIL_PASS
-// reached this process. Real verify happens on first email send (lazy).
-try { require('./services/emailService').logConfigStatus(); } catch (_) { /* optional */ }
+// ── Boot-time SMTP config visibility + LIVE verify ──────────────────────────
+// logConfigStatus prints whether EMAIL_USER / EMAIL_PASS reached the process
+// (secret-safe: length only). verifyOnBoot then performs a real
+// transporter.verify() against Gmail and logs SUCCESS or the EXACT failure
+// reason — so a bad credential is visible the moment the server starts, not
+// when the first user registers. Non-blocking: the server boots either way.
+try {
+  const emailService = require('./services/emailService');
+  emailService.logConfigStatus();
+  emailService.verifyOnBoot().catch(() => {});
+} catch (_) { /* optional */ }
 
 // ── Boot Redis (best-effort — server still starts if Redis is down) ────────
 // Every cache helper degrades to a pass-through when this fails.

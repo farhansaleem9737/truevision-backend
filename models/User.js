@@ -69,6 +69,20 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: null,      // Cloudinary public_id — used to delete old image on update
   },
+  // Optional profile banner/cover shown at the top of the public profile.
+  // When empty the client renders a branded gradient placeholder.
+  coverImage: {
+    type: String,
+    default: null,
+  },
+  coverImagePublicId: {
+    type: String,
+    default: null,
+  },
+  // Moderation: an admin can suspend a creator (blocks new uploads). Enforced
+  // in VideoController.createVideo; does not touch the login/auth flow.
+  isSuspended: { type: Boolean, default: false },
+  suspendedAt: { type: Date, default: null },
   bio: {
     type: String,
     default: '',
@@ -94,6 +108,21 @@ const userSchema = new mongoose.Schema({
     select: false
   },
   verificationOTPExpires: {
+    type: Date,
+    select: false
+  },
+  // Resend-OTP abuse guards: rolling 1-hour window counter + last-sent stamp
+  // (drives the 60s cooldown + max-resends-per-hour rule in resendOTP).
+  verificationOTPSentAt: {
+    type: Date,
+    select: false
+  },
+  verificationOTPResendCount: {
+    type: Number,
+    default: 0,
+    select: false
+  },
+  verificationOTPResendWindow: {
     type: Date,
     select: false
   },
@@ -215,8 +244,10 @@ userSchema.methods.comparePassword = async function(candidatePassword) {
 
 userSchema.methods.generateVerificationOTP = function() {
   const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  // Overwrites any previous OTP → the old code is invalid from this moment.
   this.verificationOTP = otp;
   this.verificationOTPExpires = Date.now() + 15 * 60 * 1000;
+  this.verificationOTPSentAt  = new Date();   // drives the resend cooldown
   return otp;
 };
 

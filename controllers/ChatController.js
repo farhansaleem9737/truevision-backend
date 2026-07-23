@@ -130,6 +130,12 @@ exports.getMyChats = async (req, res) => {
       const members = (chat.members || []).map(m => privacy.applyPresencePolicy(m, userId));
       const other = members.find(m => m._id.toString() !== userId);
       const unreadCount = chat.unreadCount?.[userId] || 0;
+      // Mute is active if the user is in mutedBy AND either has no expiry
+      // ("Always") or the expiry is still in the future. A lapsed expiry reads
+      // as unmuted (cleaned up on the next toggle).
+      const inMuted   = (chat.mutedBy || []).some(u => u.toString() === userId);
+      const muteUntil = chat.mutedUntil?.[userId] ? new Date(chat.mutedUntil[userId]) : null;
+      const muteActive = inMuted && (!muteUntil || muteUntil.getTime() > Date.now());
       return {
         _id:         chat._id,
         type:        chat.type,
@@ -141,7 +147,8 @@ exports.getMyChats = async (req, res) => {
         unreadCount,
         // Per-user derived state.
         isPinned:   (chat.pinnedBy   || []).some(u => u.toString() === userId),
-        isMuted:    (chat.mutedBy    || []).some(u => u.toString() === userId),
+        isMuted:    muteActive,
+        muteUntil:  muteActive && muteUntil ? muteUntil : null,
         isArchived: (chat.archivedBy || []).some(u => u.toString() === userId),
         updatedAt:  chat.updatedAt,
       };
@@ -535,6 +542,20 @@ exports.deleteMessage = async (req, res) => {
       }
       message.deleted = true;
       message.text    = '';
+      // Destroy the Cloudinary assets BEFORE nulling the pointers — otherwise
+      // delete-for-everyone permanently orphans chat images / voice notes /
+      // documents in storage (publicIds are wiped, nothing can clean them up
+      // later). Best-effort: a storage failure never blocks the delete.
+      try {
+        const cloudinary = require('../config/cloudinary');
+        const destroys = [];
+        if (message.imagePublicId)    destroys.push(cloudinary.uploader.destroy(message.imagePublicId,    { resource_type: 'image' }));
+        if (message.audioPublicId)    destroys.push(cloudinary.uploader.destroy(message.audioPublicId,    { resource_type: 'video' })); // voice notes are 'video' type
+        if (message.documentPublicId) destroys.push(cloudinary.uploader.destroy(message.documentPublicId, { resource_type: 'raw' }));
+        if (destroys.length) Promise.allSettled(destroys).then((rs) => rs.forEach((r) => {
+          if (r.status === 'rejected') console.warn('[deleteMessage] cloudinary destroy failed:', r.reason?.message);
+        }));
+      } catch (_) { /* best-effort */ }
       // Wipe media pointers so the tombstone bubble has nothing to render.
       message.imageUrl = null;
       message.audioUrl = null;
@@ -836,17 +857,73 @@ const toggleUserFlag = (field) => async (req, res) => {
 };
 
 exports.togglePinChat    = toggleUserFlag('pinnedBy');
-exports.toggleMuteChat   = toggleUserFlag('mutedBy');
 exports.toggleArchive    = toggleUserFlag('archivedBy');
 
+// Mute — supports timed mutes (8h / 24h / 1 week) and "Always", plus unmute.
+// Backward compatible: with no `duration` in the body it behaves as a plain
+// on/off toggle (used by the inbox swipe action), muting "Always" when off.
+const MUTE_DURATIONS = {
+  '8h':  8  * 60 * 60 * 1000,
+  '24h': 24 * 60 * 60 * 1000,
+  '1w':  7  * 24 * 60 * 60 * 1000,
+};
+exports.toggleMuteChat = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { chatId } = req.params;
+    const { duration } = req.body || {};
+
+    const chat = await Chat.findById(chatId).select('members mutedBy').lean();
+    if (!chat) return fail(res, 'Chat not found', 404);
+    if (!chat.members.some(m => m.toString() === userId)) return fail(res, 'Not a member', 403);
+
+    const alreadyMuted = (chat.mutedBy || []).some(u => u.toString() === userId);
+    const key = `mutedUntil.${userId}`;
+
+    // Resolve the requested action.
+    let mute;        // final muted state
+    let until = null;
+    if (duration === undefined || duration === null) {
+      mute = !alreadyMuted;          // legacy toggle → mute "Always"
+    } else if (duration === 'off') {
+      mute = false;
+    } else if (duration === 'always') {
+      mute = true;
+    } else if (MUTE_DURATIONS[duration]) {
+      mute = true;
+      until = new Date(Date.now() + MUTE_DURATIONS[duration]);
+    } else {
+      return fail(res, 'Invalid mute duration');
+    }
+
+    const update = mute
+      ? { $addToSet: { mutedBy: userId }, ...(until ? { $set: { [key]: until } } : { $unset: { [key]: '' } }) }
+      : { $pull: { mutedBy: userId }, $unset: { [key]: '' } };
+    await Chat.updateOne({ _id: chatId }, update);
+
+    return ok(res, { muted: mute, muteUntil: until });
+  } catch (err) {
+    console.error('toggleMuteChat error:', err);
+    return fail(res, 'Failed', 500);
+  }
+};
+
 // Clear-history — only for the requesting user; other members keep the messages.
+// `undo:true` in the body removes the just-set horizon again (powers the Undo
+// snackbar) so previously-cleared messages become visible to this user once more.
 exports.clearChat = async (req, res) => {
   try {
     const userId = req.user.id;
     const { chatId } = req.params;
+    const undo = req.body?.undo === true;
     const chat = await Chat.findById(chatId).select('members').lean();
     if (!chat) return fail(res, 'Chat not found', 404);
     if (!chat.members.some(m => m.toString() === userId)) return fail(res, 'Not a member', 403);
+
+    if (undo) {
+      await Chat.updateOne({ _id: chatId }, { $unset: { [`clearedAt.${userId}`]: '' } });
+      return ok(res, { message: 'Clear undone', restored: true });
+    }
 
     await Chat.updateOne(
       { _id: chatId },

@@ -85,6 +85,10 @@ exports.resolveKind = (kind, userId) => {
     // ── Help & Support ──────────────────────────────────────────────────
     case 'support-image': return { folder: F.support,        resourceType: 'image' };
     case 'support-video': return { folder: F.support,        resourceType: 'video' };
+    // TODO (production): 'raw' delivery (PDF/ZIP/docs — chat-doc + support-doc)
+    // is blocked by default on many Cloudinary accounts. Verify "Allow delivery
+    // of PDF and ZIP files" is enabled in the Cloudinary console, or document
+    // links will 403 on delivery regardless of this code. Image/video are fine.
     case 'support-doc':   return { folder: F.support,        resourceType: 'raw'   };
     default: return null;
   }

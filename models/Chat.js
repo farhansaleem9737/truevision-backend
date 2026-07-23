@@ -59,6 +59,11 @@ const chatSchema = new mongoose.Schema({
   pinnedBy:   [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   mutedBy:    [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   archivedBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  // Optional per-user mute expiry: { "<userId>": <Date> }. A member listed in
+  // mutedBy with NO entry here (or a null value) is muted forever ("Always").
+  // An entry in the past means the mute has lapsed — treated as unmuted and
+  // lazily cleared by getMyChats / toggleMuteChat.
+  mutedUntil: { type: Map, of: Date, default: {} },
   // Fully-cleared-history — the messages are still on disk for the other
   // members, but this user only sees messages newer than clearedAt[them].
   clearedAt: { type: Map, of: Date, default: {} },

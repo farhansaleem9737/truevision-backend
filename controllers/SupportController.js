@@ -225,7 +225,7 @@ exports.getFaqs = (req, res) => {
 // ADMIN
 // ═════════════════════════════════════════════════════════════════════════════
 const requireAdmin = (req, res) => {
-  if (req.user.role !== 'admin') { fail(res, 'Admin access required', 403); return false; }
+  if (!req.admin && req.user?.role !== 'admin') { fail(res, 'Admin access required', 403); return false; }
   return true;
 };
 

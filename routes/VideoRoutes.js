@@ -7,8 +7,10 @@ const { upload } = require('../middleware/upload');
 const {
   getUploadSignature,
   getAttachmentSignature,
+  getEvidenceFileUrl,
   createVideo,
   getFeed,
+  getFollowingFeed,
   getVideoById,
   getUserVideos,
   updateVideo,
@@ -21,6 +23,7 @@ const {
   searchVideos,
   searchHashtags,
   recomputeRankings,
+  remoderatePending,
   toggleLike,
   toggleSave,
   toggleRepost,
@@ -34,6 +37,11 @@ const {
   getLikedVideos,
   getFavoriteVideos,
 } = require('../controllers/VideoController');
+
+const {
+  getMyModeration,
+  submitReviewRequest,
+} = require('../controllers/ReviewController');
 
 const {
   getComments,
@@ -72,10 +80,19 @@ router.post('/create', protect, createVideo);
 // isLiked/isSaved flags, and the owner exemption in the hide-count strip.
 router.get('/feed', maybeAuth, getFeed);
 
+// GET    /api/videos/following      — Videos from creators the user follows,
+// newest first. protect: a Following feed is meaningless without an identity.
+router.get('/following', protect, getFollowingFeed);
+
 // POST   /api/videos/admin/recompute-rankings  — Backfill ranking scores
 //        Optional: ?ai=true to call Gemini on un-analysed videos
 //        Admin role required.
 router.post('/admin/recompute-rankings', protect, recomputeRankings);
+
+// POST   /api/videos/admin/remoderate-pending  — Recovery backfill: re-classify
+//        and publish/block every video stuck in pending_review/processing.
+//        Run after (re)starting the AI service. Admin role required.
+router.post('/admin/remoderate-pending', protect, remoderatePending);
 
 // GET    /api/videos/search          — Search videos by keyword
 router.get('/search', maybeAuth, searchVideos);
@@ -95,9 +112,18 @@ router.get('/favorites', protect, getFavoriteVideos);
 // GET    /api/videos/archived        — Current user's archived videos (auth required, owner-only list)
 router.get('/archived',  protect, getArchivedVideos);
 
+// GET    /api/videos/mine/moderation — My uploads in the moderation queue
+//        (processing / blocked / pending_review / rejected / changes_requested)
+router.get('/mine/moderation', protect, getMyModeration);
+
 // GET    /api/videos/user/:userId    — Videos uploaded by a specific user
 // maybeAuth: isOwner controls private-video visibility + hide-count strip.
 router.get('/user/:userId', maybeAuth, getUserVideos);
+
+// GET    /api/videos/:id/evidence/:index/url — Short-lived authenticated
+//        download link for an evidence PDF/doc (Cloudinary blocks public raw
+//        PDF delivery). Query: ?field=source|news (default source).
+router.get('/:id/evidence/:index/url', protect, getEvidenceFileUrl);
 
 // GET    /api/videos/:id             — Single video details
 // maybeAuth: owner exemption for archived videos + hide-count strip.
@@ -152,6 +178,10 @@ router.post('/:id/share',          maybeAuth, shareVideo);
 
 // POST   /api/videos/:id/report          — Report video
 router.post('/:id/report',         protect, reportVideo);
+
+// POST   /api/videos/:videoId/review-request — Appeal a blocked upload (creates
+//        a Pending review ticket for the admin moderation queue).
+router.post('/:videoId/review-request', protect, submitReviewRequest);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // COMMENTS

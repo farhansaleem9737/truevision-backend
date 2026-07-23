@@ -18,6 +18,7 @@
 const mongoose = require('mongoose');
 const User     = require('../models/User');
 const Video    = require('../models/Video');
+const Report   = require('../models/Report');
 const cache    = require('../services/cache');
 const privacy  = require('../services/privacy');
 
@@ -92,7 +93,7 @@ exports.getUserProfile = async (req, res) => {
 
     const viewerId = String(req.user.id);
     const target = await User.findById(userId).select(
-      'fullName username bio profileImage isVerified createdAt ' +
+      'fullName username bio profileImage coverImage isVerified createdAt ' +
       'followers following followRequests blockedUsers preferences isOnline lastSeen',
     );
 
@@ -103,11 +104,14 @@ exports.getUserProfile = async (req, res) => {
     const targetId = String(target._id);
     const p        = privacy.getPrivacy(target);
 
-    // Only videos the app would actually show count toward the total.
+    // Only videos the app would actually show count toward the total — exclude
+    // moderation-queued / blocked uploads so the count matches the visible grid.
+    const { PUBLIC_REVIEW_FILTER } = require('../services/moderationPolicy');
     const totalVideos = await Video.countDocuments({
       userId:     target._id,
       status:     'active',
       isArchived: { $ne: true },
+      ...PUBLIC_REVIEW_FILTER,
     });
 
     // Relationship flags (viewer ↔ target).
@@ -129,6 +133,7 @@ exports.getUserProfile = async (req, res) => {
         username:       target.username,
         bio:            target.bio || '',
         profileImage:   target.profileImage || null,
+        coverImage:     target.coverImage || null,
         isVerified:     target.isVerified,
         createdAt:      target.createdAt,
         followersCount: target.followers?.length || 0,
@@ -444,6 +449,45 @@ exports.blockUser = async (req, res) => {
   } catch (err) {
     console.error('blockUser error:', err);
     return fail(res, 'Failed to block user', 500);
+  }
+};
+
+// POST /api/users/:userId/report — file a moderation report against a user.
+// Body: { reason, details?, context?, chatId? }. Idempotent-ish: a second
+// report while an earlier one is still open (pending/reviewing) is accepted
+// silently without creating a duplicate row.
+const REPORT_REASONS = ['spam', 'harassment', 'fake', 'inappropriate', 'other'];
+exports.reportUser = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const me = String(req.user.id);
+    const { reason, details, context, chatId } = req.body || {};
+
+    if (!isObjectId(userId))         return fail(res, 'Invalid user id');
+    if (userId === me)               return fail(res, "You can't report yourself");
+    if (!REPORT_REASONS.includes(reason)) return fail(res, 'Invalid report reason');
+
+    const exists = await User.exists({ _id: userId });
+    if (!exists) return fail(res, 'User not found', 404);
+
+    // Collapse duplicate open reports from the same reporter.
+    const open = await Report.findOne({
+      reporter: me, reportedUser: userId, status: { $in: ['pending', 'reviewing'] },
+    }).select('_id').lean();
+    if (open) return ok(res, { reportId: open._id, deduped: true });
+
+    const report = await Report.create({
+      reporter:     me,
+      reportedUser: userId,
+      reason,
+      details:      typeof details === 'string' ? details.slice(0, 1000) : '',
+      context:      ['chat', 'profile', 'comment', 'video', 'other'].includes(context) ? context : 'chat',
+      chatId:       isObjectId(chatId) ? chatId : null,
+    });
+    return ok(res, { reportId: report._id }, 201);
+  } catch (err) {
+    console.error('reportUser error:', err);
+    return fail(res, 'Failed to submit report', 500);
   }
 };
 

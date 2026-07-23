@@ -23,6 +23,10 @@ const QUALITY_LADDER = [
   { label: '360p',  width: 640,  height: 360  },
   { label: '480p',  width: 854,  height: 480  },
   { label: '720p',  width: 1280, height: 720  },
+  // 1080p is generated on-demand (NOT eager — see EAGER_RUNGS) so uploads stay
+  // fast; it transcodes lazily on first request. The client only reaches for it
+  // on Wi-Fi (see utils/videoQuality.js), so most sessions never trigger it.
+  { label: '1080p', width: 1920, height: 1080 },
 ];
 
 // ── Upload a Buffer to Cloudinary ─────────────────────────────────────────────

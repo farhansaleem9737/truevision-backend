@@ -3,7 +3,8 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { OAuth2Client } = require('google-auth-library');
 const { sendVerificationEmail, sendPasswordResetEmail, sendTestEmail,
-        sendSecurityOtpEmail, sendSecurityAlertEmail } = require('../services/emailService');
+        sendSecurityOtpEmail, sendSecurityAlertEmail,
+        humanizeSmtpError } = require('../services/emailService');
 const cloudinary = require('../config/cloudinary');
 const sessionTracker = require('../services/sessionTracker');
 const refreshTokens  = require('../services/refreshTokens');
@@ -25,6 +26,9 @@ const googleClient = new OAuth2Client();
 // active users out. Verification in middleware/Auth.js is UNCHANGED.
 const generateToken = (userId) => {
   return jwt.sign({ userId }, process.env.JWT_SECRET, {
+    // TODO (production): reduce ACCESS_TOKEN_TTL to '15m' after deployment, once
+    // the client refresh flow is confirmed working on-device. Defaulted to '1h'
+    // during development for a comfortable safety buffer.
     expiresIn: process.env.ACCESS_TOKEN_TTL || '1h',
   });
 };
@@ -155,15 +159,19 @@ exports.register = async (req, res) => {
     const otp = user.generateVerificationOTP();
     await user.save();
 
-    // Send verification email. Failure behaviour depends on environment:
-    //   • production → roll back the user, return HTTP 500 (per spec)
-    //   • non-prod   → keep the user, log the OTP to the console + expose
-    //                  it in the response under `devOtp` so QA can keep
-    //                  testing while SMTP is being fixed.
+    // Send verification email. "OTP sent" is claimed ONLY after the provider
+    // confirms acceptance (messageId). Failure behaviour:
+    //   • production        → roll back the user, return HTTP 500
+    //   • DEBUG_OTP=true    → explicit debug mode: keep the user, print the
+    //                         OTP to the console + expose devOtp (QA only)
+    //   • otherwise (dev)   → keep the user, but tell the client the EXACT
+    //                         reason the email failed. No OTP is printed.
     const emailResult = await sendVerificationEmail(email, fullName, otp);
 
     if (!emailResult.success) {
-      const isProd = process.env.NODE_ENV === 'production';
+      const isProd  = process.env.NODE_ENV === 'production';
+      const debugOtp = process.env.DEBUG_OTP === 'true';
+      const reason  = humanizeSmtpError(emailResult.error);
 
       if (isProd) {
         try { await User.deleteOne({ _id: user._id }); } catch (_) { /* ignore */ }
@@ -173,25 +181,32 @@ exports.register = async (req, res) => {
         });
       }
 
-      // Dev fallback — registration succeeds, OTP shown in console + body.
-      console.log('\n' + '═'.repeat(60));
-      console.log('  DEV FALLBACK — SMTP failed but user is created.');
-      console.log('  Account: ' + email);
-      console.log('  OTP:     ' + otp + '   (15 min)');
-      console.log('  Fix SMTP → see /api/auth/test-email response.');
-      console.log('═'.repeat(60) + '\n');
+      if (debugOtp) {
+        // Explicit debug mode only — never the default.
+        console.log('\n' + '═'.repeat(60));
+        console.log('  DEBUG_OTP — SMTP failed but user is created.');
+        console.log('  Account: ' + email);
+        console.log('  OTP:     ' + otp + '   (15 min)');
+        console.log('  Reason:  ' + reason);
+        console.log('═'.repeat(60) + '\n');
+        return res.status(201).json({
+          success: true,
+          message: 'Registration successful. DEBUG_OTP mode — the verification code is in the server console.',
+          data: {
+            userId: user._id, email: user.email, username: user.username,
+            emailSent: false, devOtp: otp,
+          },
+        });
+      }
 
-      return res.status(201).json({
-        success: true,
-        message: 'Registration successful. Email transport is offline — the verification code is shown in the server console.',
-        data: {
-          userId:    user._id,
-          email:     user.email,
-          username:  user.username,
-          emailSent: false,
-          devOtp:    otp,
-          smtpError: emailResult.error,
-        },
+      // Honest failure: the account exists (so Resend works once SMTP is
+      // fixed) but the client is told exactly why no email arrived.
+      console.error('[register] Verification email FAILED for', email, '—', reason);
+      return res.status(502).json({
+        success: false,
+        code:    'EMAIL_SEND_FAILED',
+        message: `Account created, but the verification email could not be sent. ${reason}`,
+        data: { userId: user._id, email: user.email, emailSent: false },
       });
     }
 
@@ -282,6 +297,10 @@ exports.verifyEmail = async (req, res) => {
 // @desc    Resend verification OTP
 // @route   POST /api/auth/resend-otp
 // @access  Public
+const RESEND_COOLDOWN_MS  = 60 * 1000;        // one resend per 60s per account
+const RESEND_MAX_PER_HOUR = 5;                // hard cap per rolling hour
+const RESEND_WINDOW_MS    = 60 * 60 * 1000;
+
 exports.resendOTP = async (req, res) => {
   try {
     const { email } = req.body;
@@ -293,7 +312,8 @@ exports.resendOTP = async (req, res) => {
       });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase() });
+    const user = await User.findOne({ email: email.toLowerCase() })
+      .select('+verificationOTPSentAt +verificationOTPResendCount +verificationOTPResendWindow');
 
     if (!user) {
       return res.status(404).json({
@@ -309,36 +329,78 @@ exports.resendOTP = async (req, res) => {
       });
     }
 
-    // Generate new OTP
+    const now = Date.now();
+
+    // ── Per-account cooldown (60s between sends) ─────────────────────────
+    const lastSent = user.verificationOTPSentAt ? new Date(user.verificationOTPSentAt).getTime() : 0;
+    const sinceLast = now - lastSent;
+    if (lastSent && sinceLast < RESEND_COOLDOWN_MS) {
+      const retryAfter = Math.ceil((RESEND_COOLDOWN_MS - sinceLast) / 1000);
+      return res.status(429).json({
+        success: false,
+        code: 'RESEND_COOLDOWN',
+        message: `Please wait ${retryAfter}s before requesting another code.`,
+        retryAfter,
+      });
+    }
+
+    // ── Rolling-hour cap (max 5 resends) ─────────────────────────────────
+    const windowStart = user.verificationOTPResendWindow ? new Date(user.verificationOTPResendWindow).getTime() : 0;
+    if (!windowStart || now - windowStart > RESEND_WINDOW_MS) {
+      user.verificationOTPResendWindow = new Date(now);
+      user.verificationOTPResendCount  = 0;
+    }
+    if (user.verificationOTPResendCount >= RESEND_MAX_PER_HOUR) {
+      const retryAfter = Math.ceil((windowStart + RESEND_WINDOW_MS - now) / 1000);
+      return res.status(429).json({
+        success: false,
+        code: 'RESEND_LIMIT',
+        message: 'Too many codes requested. Try again later.',
+        retryAfter,
+      });
+    }
+
+    // New OTP — overwrites (invalidates) the previous code + restarts expiry.
     const otp = user.generateVerificationOTP();
+    user.verificationOTPResendCount += 1;
     await user.save();
 
-    // Send email. Same environment-aware policy as register: prod fails
-    // hard, non-prod returns success with the OTP for local testing.
     const emailResult = await sendVerificationEmail(email, user.fullName, otp);
 
     if (!emailResult.success) {
-      const isProd = process.env.NODE_ENV === 'production';
+      const isProd   = process.env.NODE_ENV === 'production';
+      const debugOtp = process.env.DEBUG_OTP === 'true';
+      const reason   = humanizeSmtpError(emailResult.error);
+
       if (isProd) {
         return res.status(500).json({
           success: false,
           message: 'Failed to send verification code. Please try again later.',
         });
       }
-      console.log('\n' + '═'.repeat(60));
-      console.log('  DEV FALLBACK — Resend SMTP failed. OTP:', otp, '(account:', email + ')');
-      console.log('═'.repeat(60) + '\n');
-      return res.status(200).json({
-        success:   true,
-        message:   'Email transport is offline — the verification code is shown in the server console.',
-        devOtp:    otp,
-        smtpError: emailResult.error,
+      if (debugOtp) {
+        console.log('\n' + '═'.repeat(60));
+        console.log('  DEBUG_OTP — Resend SMTP failed. OTP:', otp, '(account:', email + ')');
+        console.log('  Reason:', reason);
+        console.log('═'.repeat(60) + '\n');
+        return res.status(200).json({
+          success: true,
+          message: 'DEBUG_OTP mode — the verification code is in the server console.',
+          devOtp:  otp,
+        });
+      }
+      console.error('[resendOTP] send FAILED for', email, '—', reason);
+      return res.status(502).json({
+        success: false,
+        code:    'EMAIL_SEND_FAILED',
+        message: `Could not send the verification email. ${reason}`,
       });
     }
 
     res.status(200).json({
       success: true,
-      message: 'Verification code sent successfully!'
+      message: 'Verification code sent successfully!',
+      retryAfter: Math.ceil(RESEND_COOLDOWN_MS / 1000),   // client countdown sync
     });
   } catch (error) {
     console.error('Resend OTP error:', error);

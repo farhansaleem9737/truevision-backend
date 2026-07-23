@@ -106,7 +106,70 @@ const formatSmtpError = (err) => ({
   stack:        err?.stack,
 });
 
-exports._formatSmtpError = formatSmtpError; // exported for use in controllers / test route
+// Map a raw SMTP failure to the exact human-readable reason the client (and
+// the server log) should show. Never hides the cause behind a generic string.
+const humanizeSmtpError = (detail = {}) => {
+  const { code, responseCode, message = '' } = detail;
+  if (!readUser() || !readPass())            return 'Missing email configuration (EMAIL_USER / EMAIL_PASSWORD not set)';
+  if (code === 'EAUTH' || responseCode === 535)
+    return 'SMTP authentication failed — Gmail rejected EMAIL_USER/EMAIL_PASSWORD. Regenerate the App Password (16 chars) at myaccount.google.com/apppasswords';
+  if (code === 'EDNS' || /getaddrinfo/i.test(message))          return 'DNS error — could not resolve smtp.gmail.com (check internet/DNS)';
+  if (code === 'ETIMEDOUT' || code === 'ECONNECTION' || code === 'ESOCKET' || /timeout/i.test(message))
+    return 'SMTP connection timeout — network/firewall is blocking smtp.gmail.com:465';
+  if (/certificate|tls|ssl/i.test(message))                     return 'TLS error while connecting to Gmail';
+  if (responseCode === 550 || responseCode === 553)             return 'Provider rejected the sender address';
+  if (responseCode === 421 || responseCode === 454 || /rate|too many/i.test(message))
+    return 'Gmail rate limit — too many emails sent; try again shortly';
+  return `Email provider error${responseCode ? ` (${responseCode})` : ''}: ${message.split('\n')[0] || 'unknown'}`;
+};
+
+// Transient failures (network blips, timeouts, greeting failures) are worth ONE
+// automatic retry after a short pause. Auth/config failures are NOT — retrying
+// a bad password just hammers Gmail and risks a lockout.
+const isTransientSmtpError = (err) =>
+  ['ETIMEDOUT', 'ECONNECTION', 'ESOCKET', 'ECONNRESET', 'EPIPE'].includes(err?.code) ||
+  [421, 450, 451].includes(err?.responseCode);
+
+/**
+ * sendMail with one automatic retry on transient failures. On a retryable
+ * error the pooled transporter is reset first so we don't reuse a dead socket.
+ */
+const sendWithRetry = async (mailOptions) => {
+  let transporter = await getTransporter();
+  try {
+    return await transporter.sendMail(mailOptions);
+  } catch (err) {
+    if (!isTransientSmtpError(err)) throw err;
+    console.warn('[emailService] transient SMTP failure — retrying once:', err.code || err.responseCode);
+    resetTransporter();
+    await new Promise((r) => setTimeout(r, 1500));
+    transporter = await getTransporter();
+    return transporter.sendMail(mailOptions);
+  }
+};
+
+/**
+ * Boot-time SMTP verification (spec: "Call transporter.verify() during server
+ * startup. Log success or failure."). Non-blocking — the server still boots on
+ * failure, but the log states the EXACT reason so a bad credential can never
+ * hide until the first user registers.
+ */
+exports.verifyOnBoot = async () => {
+  try {
+    await getTransporter();
+    console.log('[emailService] ✅ Boot SMTP verify OK — email delivery is LIVE.');
+    return { success: true };
+  } catch (err) {
+    const detail = formatSmtpError(err);
+    console.error('[emailService] ❌ Boot SMTP verify FAILED — emails WILL NOT send.');
+    console.error('[emailService] Reason:', humanizeSmtpError(detail));
+    console.error('[emailService] Raw:', { code: detail.code, responseCode: detail.responseCode, response: (detail.response || '').split('\n')[0] });
+    return { success: false, error: detail };
+  }
+};
+
+exports._formatSmtpError  = formatSmtpError; // exported for use in controllers / test route
+exports.humanizeSmtpError = humanizeSmtpError;
 exports._resetTransporter = resetTransporter;
 exports._getTransporter   = getTransporter;
 
@@ -721,9 +784,7 @@ const getPasswordResetEmailHTML = (fullName, otp) => `
 // Send verification email — uses the verified, cached transporter.
 exports.sendVerificationEmail = async (email, fullName, otp) => {
   try {
-    const transporter = await getTransporter();
-
-    const info = await transporter.sendMail({
+    const info = await sendWithRetry({
       from:    { name: 'TrueVision', address: readUser() },
       to:      email,
       subject: '🎬 Verify Your TrueVision Account',
@@ -748,9 +809,7 @@ exports.sendVerificationEmail = async (email, fullName, otp) => {
 // Send password reset email — uses the verified, cached transporter.
 exports.sendPasswordResetEmail = async (email, fullName, otp) => {
   try {
-    const transporter = await getTransporter();
-
-    const info = await transporter.sendMail({
+    const info = await sendWithRetry({
       from:    { name: 'TrueVision Security', address: readUser() },
       to:      email,
       subject: '🔒 Reset Your TrueVision Password',

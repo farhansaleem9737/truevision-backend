@@ -8,6 +8,7 @@ const { uploadToCloudinary, deleteFromCloudinary,
         buildQualityUrls, buildThumbnailUrl,
         buildEagerString }                          = require('../middleware/upload');
 const { checkContent }                                            = require('../utils/contentFilter');
+const { PUBLIC_REVIEW_FILTER, HIDDEN_REVIEW_STATES }              = require('../services/moderationPolicy');
 const { scoreVideo, computeSensitivity, personalizeScore }        = require('../services/contentRanking');
 const { classifyContent }                                         = require('../services/geminiClassifier');
 const { classifyCloudinaryVideo }                                 = require('../services/nsfwModeration');
@@ -30,8 +31,14 @@ const kFeed      = ({ sort, category, page, limit, viewerId }) =>
 const kVideo     = (id)   => `video:byId:${id}`;
 const kHashtag   = (q,l)  => `video:hashtag:${(q||'').toLowerCase()}:${l}`;
 
-/** Wipe every cached feed permutation. Cheap enough to run on any Video mutation. */
-const invalidateFeed  = () => cache.delByPrefix('video:feed:*').catch(() => {});
+/**
+ * Wipe every cached feed permutation — both the trending/new pages
+ * (`video:feed:*`) AND the per-viewer personalized pools (`video:foryou:pool:*`).
+ * Call this whenever a video's PUBLIC visibility changes (new approved upload,
+ * admin approve/reject, block/unblock, delete) so the change surfaces on the
+ * very next fetch instead of after the 30 s TTL. Cheap SCAN-based delete.
+ */
+const invalidateFeed  = () => feedCache.invalidatePublicFeeds();
 /** Drop a single video's cache after mutation. */
 const invalidateVideo = (id) => cache.del(kVideo(String(id))).catch(() => {});
 
@@ -162,9 +169,21 @@ exports.getAttachmentSignature = async (req, res) => {
     const kind         = (req.query.kind || 'raw').toString();
     const resourceType = kind === 'image' ? 'image' : 'raw';
 
+    // Raw (PDF/doc) attachments are stored as Cloudinary type 'private' when
+    // the client opts in (?access=private). Public delivery of raw PDFs is
+    // blocked on this account ("deny or ACL failure" — verified empirically),
+    // and neither signed delivery URLs nor basic auth bypass it. 'private'
+    // assets ARE downloadable via utils.private_download_url, which the
+    // evidence-url endpoint below mints on demand. Opt-in keeps the signature
+    // backward-compatible with older app builds that don't send a `type` field.
+    const accessType = resourceType === 'raw' && req.query.access === 'private'
+      ? 'private' : null;
+
     const timestamp = Math.round(Date.now() / 1000);
     const folder    = `truevision/attachments/${req.user.id}`;
-    const paramsToSign = { folder, timestamp };
+    const paramsToSign = accessType
+      ? { folder, timestamp, type: accessType }
+      : { folder, timestamp };
 
     const signature = cloudinary.utils.api_sign_request(
       paramsToSign,
@@ -176,12 +195,143 @@ exports.getAttachmentSignature = async (req, res) => {
       timestamp,
       folder,
       resourceType,
+      ...(accessType ? { type: accessType } : {}),
       api_key:    process.env.CLOUDINARY_API_KEY,
       cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
     });
   } catch (err) {
     console.error('getAttachmentSignature error:', err);
     return fail(res, 'Could not generate attachment signature', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EVIDENCE FILE URL  (short-lived authenticated download link)
+// GET /api/videos/:id/evidence/:index/url?field=source|news
+//
+// Why this exists: raw PDF/doc delivery is blocked account-wide on Cloudinary
+// (public, signed and basic-auth GETs all return 401 "deny or ACL failure"),
+// so the secure_url stored in sourceFiles/newsFiles is not directly openable.
+// 'private'-type assets, however, can be fetched through a time-limited
+// utils.private_download_url. This endpoint:
+//   1. finds the requested evidence entry,
+//   2. lazily migrates legacy public assets in place (rename upload → private —
+//      same public_id, so stored DB rows stay valid),
+//   3. returns a fresh 10-minute download URL the app can open/download.
+// Images skip all of this — image delivery is not blocked.
+// ─────────────────────────────────────────────────────────────────────────────
+const EVIDENCE_URL_TTL = 600; // seconds
+
+// public_id from a stored raw delivery URL (legacy rows may lack publicId).
+// e.g. https://res.cloudinary.com/<cloud>/raw/upload/v123/truevision/attachments/<uid>/x.pdf
+const rawPublicIdFromUrl = (url) => {
+  const m = /\/raw\/(?:upload|private|authenticated)\/(?:s--[^/]+--\/)?(?:v\d+\/)?(.+?)(?:\?.*)?$/
+    .exec(String(url || ''));
+  try { return m ? decodeURIComponent(m[1]) : null; } catch { return m ? m[1] : null; }
+};
+
+// Destroy a raw evidence blob that may live as type 'private' (new uploads /
+// lazily-migrated) or legacy public 'upload' — the wrong guess returns
+// { result: 'not found' } harmlessly. Throws only when Cloudinary errored on
+// every attempt without confirming deletion, so deleteVideo's cascade logger
+// actually sees the failure instead of an always-fulfilled allSettled wrapper.
+const destroyRawEvidence = async (publicId) => {
+  let lastErr = null;
+  let deleted = false;
+  for (const type of ['private', 'upload']) {
+    try {
+      const r = await cloudinary.uploader.destroy(publicId, { resource_type: 'raw', type });
+      if (r?.result === 'ok') deleted = true;
+    } catch (e) { lastErr = e; }
+  }
+  if (!deleted && lastErr) throw lastErr;
+  return { result: deleted ? 'ok' : 'not found' };
+};
+
+exports.getEvidenceFileUrl = async (req, res) => {
+  try {
+    const { id, index } = req.params;
+    const field = req.query.field === 'news' ? 'newsFiles' : 'sourceFiles';
+    const idx = Number(index);
+    if (!Number.isInteger(idx) || idx < 0) return fail(res, 'Evidence file not found', 404);
+
+    const video = await Video.findById(id)
+      .select(`${field} status userId isArchived reviewStatus visibility`)
+      .lean();
+    if (!video || video.status === 'deleted') return fail(res, 'Video not found', 404);
+
+    // ── Access gates — mirror getVideoById exactly. Evidence must never be
+    // MORE visible than the video it belongs to. ─────────────────────────────
+    const ownerId = String(video.userId || '');
+    const viewerIsOwner = req.user?.id && ownerId && ownerId === String(req.user.id);
+    if (video.isArchived && !viewerIsOwner) return fail(res, 'Video not found', 404);
+    if (!viewerIsOwner && HIDDEN_REVIEW_STATES.includes(video.reviewStatus)) {
+      return fail(res, 'Video not found', 404);
+    }
+    if (!viewerIsOwner && ownerId) {
+      const viewerId = req.user?.id || null;
+      if (await privacy.isBlockedBetween(viewerId, ownerId)) {
+        return fail(res, 'Video not found', 404);
+      }
+      const owner = await User.findById(ownerId).select('followers preferences').lean();
+      if (video.visibility === 'private') {
+        return fail(res, 'This video is private.', 403);
+      }
+      if (video.visibility === 'followers' && !privacy.isFollower(viewerId, owner)) {
+        return fail(res, 'This video is only visible to followers.', 403);
+      }
+      if (!privacy.canViewContentOf(viewerId, owner)) {
+        return fail(res, 'This account is private.', 403);
+      }
+    }
+
+    const entry = (video[field] || [])[idx];
+    if (!entry || !entry.url) return fail(res, 'Evidence file not found', 404);
+
+    // Images deliver publicly without restriction — hand back the stored URL.
+    if (entry.type === 'image') {
+      return ok(res, { url: entry.url, direct: true });
+    }
+
+    // Owner-folder scoping: attachment signatures always force the folder
+    // truevision/attachments/<uploaderId>/, so a legitimate evidence publicId
+    // MUST live under the video owner's folder. Anything else is a forged
+    // reference to someone else's asset — refuse to rename or sign it.
+    const publicId = entry.publicId || rawPublicIdFromUrl(entry.url);
+    if (!publicId || !publicId.startsWith(`truevision/attachments/${ownerId}/`)) {
+      return fail(res, 'Evidence file not found', 404);
+    }
+
+    // Lazy one-time migration: legacy assets were uploaded as public 'upload'
+    // type. rename(to_type) moves them to 'private' in place (verified: keeps
+    // the same public_id). An already-migrated asset makes rename throw
+    // "Resource not found" for the upload type — that exact error is the
+    // expected no-op; anything else (rate limit, outage) must NOT mint a
+    // link that would 404, so it fails loudly and the app shows Retry.
+    try {
+      await cloudinary.uploader.rename(publicId, publicId, {
+        resource_type: 'raw', type: 'upload', to_type: 'private', overwrite: true,
+      });
+    } catch (err) {
+      const msg = err?.message || err?.error?.message || '';
+      const isExpectedNoOp = err?.http_code === 404 || /not found/i.test(msg);
+      if (!isExpectedNoOp) {
+        console.error('getEvidenceFileUrl rename error:', msg);
+        return fail(res, 'Could not prepare the evidence link. Try again.', 503);
+      }
+    }
+
+    const expiresAt = Math.floor(Date.now() / 1000) + EVIDENCE_URL_TTL;
+    const url = cloudinary.utils.private_download_url(publicId, '', {
+      resource_type: 'raw',
+      type: 'private',
+      expires_at: expiresAt,
+    });
+
+    return ok(res, { url, expiresAt });
+  } catch (err) {
+    console.error('getEvidenceFileUrl error:', err);
+    return fail(res, 'Could not create evidence link', 500);
   }
 };
 
@@ -217,6 +367,15 @@ exports.createVideo = async (req, res) => {
 
     if (!publicId || !secureUrl) return fail(res, 'Cloudinary upload result is missing');
     if (!title?.trim())          return fail(res, 'Title is required');
+
+    console.log(`[upload] STARTED user=${req.user.id} publicId=${publicId} visibility=${visibility} dur=${duration}s bytes=${bytes}`);
+
+    // Suspended creators (moderation action) cannot upload. Clean up the
+    // already-uploaded Cloudinary asset so it doesn't linger.
+    if (req.user?.isSuspended) {
+      await deleteFromCloudinary(publicId, 'video').catch(() => {});
+      return fail(res, 'Your account is suspended and cannot upload videos.', 403);
+    }
 
     const tagArray = typeof tags === 'string'
       ? tags.split(',').map(t => t.trim().replace(/^#/, '')).filter(Boolean)
@@ -299,13 +458,19 @@ exports.createVideo = async (req, res) => {
     // Source-file arrays are sanitised to drop malformed entries (caller may
     // post partial objects mid-upload). Opinion strips all source data.
     const safeType = ['fact', 'news', 'opinion'].includes(contentType) ? contentType : null;
+    // publicId is later used to mint signed download links and to destroy the
+    // blob on delete — only accept ids inside the uploader's own attachments
+    // folder (the signature endpoint forces that folder, so legitimate uploads
+    // always match; anything else is a forged reference to a foreign asset).
+    const ownAttachment = (pid) =>
+      String(pid || '').startsWith(`truevision/attachments/${req.user.id}/`);
     const sanitizeFiles = (arr) =>
       (Array.isArray(arr) ? arr : [])
         .filter((f) => f && typeof f.url === 'string' && f.url.length > 0)
         .slice(0, 5)
         .map((f) => ({
           url:      String(f.url),
-          publicId: String(f.publicId || ''),
+          publicId: ownAttachment(f.publicId) ? String(f.publicId) : '',
           type:     ['image', 'pdf', 'document'].includes(f.type) ? f.type : 'document',
           name:     String(f.name || '').slice(0, 200),
           size:     Number(f.size) || 0,
@@ -333,6 +498,30 @@ exports.createVideo = async (req, res) => {
       rejectThreshold,
     );
 
+    // ── SYNCHRONOUS AI MODERATION — block entertainment BEFORE publishing ────
+    // Classify the text (title + description + tags) with the zero-shot
+    // classifier right now (no waiting for transcription), then decide via the
+    // shared policy. Fail CLOSED: if the AI service is unavailable, hold for
+    // manual review instead of auto-publishing — entertainment can never slip
+    // through. The deeper async transcription pass still runs for ranking, but
+    // it won't override this decision (its guard only fires on 'processing').
+    const { decideFromClassifier } = require('../services/moderationPolicy');
+    let verdict;
+    try {
+      const modText = [title, description, tagArray.join(' ')].filter(Boolean).join('. ').slice(0, 2000);
+      console.log(`[moderation] classify input (text) user=${req.user.id} chars=${modText.length}: "${modText.slice(0, 160)}"`);
+      const pred = await aiClient.predict(modText);
+      // Log the RAW model output so a wrong/hardcoded confidence is visible.
+      console.log(`[moderation] BART output category=${pred?.category} confidence=${typeof pred?.confidence === 'number' ? pred.confidence.toFixed(4) : pred?.confidence} fallback=${!!pred?.fallback} scores=${JSON.stringify(pred?.all_scores || {})}`);
+      verdict = pred?.fallback
+        ? { decision: 'pending_review', category: pred?.category || null, confidence: 0, level: 'classifier', reason: 'ai-unavailable' }
+        : decideFromClassifier({ category: pred?.category, confidence: pred?.confidence });
+      console.log(`[moderation] decision=${verdict.decision} category=${verdict.category} confidence=${Number(verdict.confidence).toFixed(4)} reason=${verdict.reason}`);
+    } catch (e) {
+      console.error('[moderation] classify failed:', e.message);
+      verdict = { decision: 'pending_review', category: null, confidence: 0, level: 'classifier', reason: 'ai-error' };
+    }
+
     const video = await Video.create({
       userId:    req.user.id,
       title:     title.trim(),
@@ -354,6 +543,18 @@ exports.createVideo = async (req, res) => {
       resolution: { width: Number(width) || 0, height: Number(height) || 0 },
       qualities,
       status: 'active',
+      // AI moderation decision made synchronously above. A 'blocked' /
+      // 'pending_review' video is NOT publicly visible; only 'approved' shows.
+      reviewStatus: verdict.decision,   // approved | blocked | pending_review
+      review: {
+        autoCategory: verdict.category,
+        confidence:   verdict.confidence,
+        decision:     verdict.decision,
+        reason:       verdict.reason,
+        decidedBy:    'ai',
+        decidedAt:    new Date(),
+        queuedAt:     new Date(),
+      },
       contentType: safeType,
       isSensitive: sensitivity.isSensitive,
       moderation: {
@@ -366,9 +567,13 @@ exports.createVideo = async (req, res) => {
       ...safeNews,
     });
 
-    // Fire-and-forget content analysis. Don't block the upload response on
-    // Gemini latency / availability — the ranking system has a tag-based
-    // fallback that runs synchronously below.
+    // Audit-log the synchronous decision + notify (creator, and followers on an
+    // approve). Fire-and-forget so the upload response isn't held up.
+    require('../services/moderationService').recordAutoDecision(video, verdict).catch(() => {});
+
+    // Fire-and-forget deeper content analysis (transcription + ranking refresh).
+    // Its moderation-decision branch is a no-op now (reviewStatus is no longer
+    // 'processing'), so it never overrides the decision made above.
     runContentAnalysis(video).catch((e) => console.error('runContentAnalysis error:', e));
 
     // Synchronous tag/engagement ranking so the video has *some* score from
@@ -382,12 +587,38 @@ exports.createVideo = async (req, res) => {
     video.rankingUpdatedAt = new Date();
     await video.save().catch(() => {});
 
+    console.log(`[upload] saved video=${video._id} user=${req.user.id} reviewStatus=${video.reviewStatus} category=${video.review?.autoCategory} confidence=${Number(video.review?.confidence ?? 0).toFixed(4)}`);
+
+    // ── FEED PUBLISHING ────────────────────────────────────────────────────
+    // Only an APPROVED video is publicly visible. Wipe the cached feed pages +
+    // personalized pools so it appears on Discover/For-You/Following on the very
+    // next fetch (no 30 s wait, no app restart). Blocked/pending stay hidden.
+    if (video.reviewStatus === 'approved') {
+      invalidateFeed();
+      console.log(`[feed] published video=${video._id} → invalidated feed + foryou pools (appears immediately)`);
+    } else {
+      console.log(`[feed] video=${video._id} NOT published (reviewStatus=${video.reviewStatus}); withheld from feeds`);
+    }
+
+    // Decision-aware response so the client can show the right modal:
+    //   approved       → "Upload Complete" (video is live)
+    //   blocked        → "Video Blocked"   (entertainment) + Request Review
+    //   pending_review → "Under Review"    (uncertain / AI offline)
+    console.log(`[upload] FINISHED video=${video._id} reviewStatus=${video.reviewStatus} — ${video.reviewStatus === 'approved' ? 'PUBLISHED (visible in all feeds)' : 'withheld (async recovery will retry when AI is reachable)'}`);
     return ok(res, {
-      message: 'Video uploaded successfully',
+      message: verdict.decision === 'approved' ? 'Video published'
+             : verdict.decision === 'blocked'  ? 'Video blocked'
+             : 'Video under review',
       video,
+      reviewStatus: video.reviewStatus,
+      blocked: verdict.decision === 'blocked',
       moderation: {
-        status:     moderation.status,
-        confidence: moderation.confidence,
+        status:             moderation.status,          // NSFW verdict (SAFE/NSFW/PORN)
+        confidence:         moderation.confidence,      // NSFW confidence 0–1
+        category:           verdict.category,           // content category (e.g. entertainment)
+        categoryConfidence: verdict.confidence,         // classifier confidence 0–1
+        decision:           verdict.decision,
+        reason:             verdict.reason,
         ...(moderation.fallback ? { fallback: true } : {}),
       },
     }, 201);
@@ -410,7 +641,7 @@ exports.getFeed = async (req, res) => {
 
     // isArchived: { $ne: true } is important — archived videos remain in
     // the collection but must never appear on public surfaces.
-    const match = { status: 'active', visibility: 'public', isReported: { $ne: true }, isArchived: { $ne: true } };
+    const match = { status: 'active', visibility: 'public', isReported: { $ne: true }, isArchived: { $ne: true }, ...PUBLIC_REVIEW_FILTER };
     if (category && category !== 'all') {
       // Accept comma-separated values for multi-category filter
       // (e.g. "education,tech,business" for the "For You" tab)
@@ -595,6 +826,81 @@ async function servePersonalizedFeed({ req, res, match, page, limit }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET FOLLOWING FEED
+// GET /api/videos/following?page=1&limit=10
+//
+// Videos from ONLY the creators the signed-in user currently follows. Newest
+// first. Approved + public only (same visibility rules as the main feed). The
+// follow set is read LIVE from the DB (not the cached token), so following a
+// creator surfaces their videos immediately and unfollowing removes them on the
+// next fetch — no restart, no stale membership. Not server-cached: correctness
+// (fresh membership) is prioritised over a 30 s cache, and the query is a single
+// indexed lookup ({ userId, status, createdAt } compound index).
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getFollowingFeed = async (req, res) => {
+  try {
+    const page  = Math.max(parseInt(req.query.page)  || 1, 1);
+    const limit = Math.min(parseInt(req.query.limit) || 10, 30);
+    const skip  = (page - 1) * limit;
+    const viewerId = req.user.id;
+
+    // Live follow set from the DB — guarantees unfollow/ follow reflect at once.
+    const me = await User.findById(viewerId).select('following').lean();
+    let followingIds = (me?.following || []).map((id) => String(id));
+
+    // Exclude blocked users (either direction) even if a stale follow edge exists.
+    const excluded = await privacy.contentExclusionsFor(viewerId);
+    if (excluded.length) {
+      const exclSet = new Set(excluded.map(String));
+      followingIds = followingIds.filter((id) => !exclSet.has(id));
+    }
+
+    console.log(`[followingFeed] viewer=${viewerId} follows=${followingIds.length} page=${page}`);
+
+    if (!followingIds.length) {
+      return ok(res, { videos: [], pagination: { page, limit, total: 0, pages: 0 } });
+    }
+
+    const objIds = followingIds.map((id) => new mongoose.Types.ObjectId(id));
+    const match = {
+      userId:     { $in: objIds },
+      status:     'active',
+      visibility: 'public',
+      isReported: { $ne: true },
+      isArchived: { $ne: true },
+      ...PUBLIC_REVIEW_FILTER,   // only approved (hides blocked/pending/rejected)
+    };
+
+    // Respect the viewer's "Hide Sensitive Content" preference (parity with feed).
+    const contentPrefs = req.user?.preferences?.content || {};
+    if (contentPrefs.hideSensitive === true) match.isSensitive = { $ne: true };
+
+    const [videos, total] = await Promise.all([
+      Video.find(match)
+        .sort({ createdAt: -1 })   // newest upload first (spec)
+        .skip(skip)
+        .limit(limit)
+        .populate('userId', 'username fullName profileImage')
+        .lean(),
+      Video.countDocuments(match),
+    ]);
+
+    const sanitized = videos.map((v) => withUserFlags(v, viewerId));
+    const enriched  = await markReposts(sanitized, viewerId);
+
+    console.log(`[followingFeed] returned=${enriched.length}/${total}`);
+
+    return ok(res, {
+      videos: enriched,
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+    });
+  } catch (err) {
+    console.error('getFollowingFeed error:', err);
+    return fail(res, 'Failed to fetch following feed', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // markReposts — annotate a list of plain video docs with isReposted=true/false
 // for the current viewer. Single round-trip to the Repost collection.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -637,6 +943,14 @@ exports.getVideoById = async (req, res) => {
     const docOwnerId = videoDoc.userId?._id || videoDoc.userId;
     const viewerIsOwner = req.user?.id && docOwnerId && String(docOwnerId) === String(req.user.id);
     if (videoDoc.isArchived && !viewerIsOwner) return fail(res, 'Video not found', 404);
+
+    // Moderation queue: videos still processing / blocked / rejected are
+    // owner-only (the owner needs to open the block screen + request review).
+    // Everyone else gets a plain 404. Legacy videos have no reviewStatus and
+    // pass through untouched.
+    if (!viewerIsOwner && HIDDEN_REVIEW_STATES.includes(videoDoc.reviewStatus)) {
+      return fail(res, 'Video not found', 404);
+    }
 
     // ── Privacy enforcement (live, never cached) ─────────────────────────
     // 1. Blocked pairs get a plain 404 — blocking is never revealed.
@@ -709,7 +1023,9 @@ exports.getUserVideos = async (req, res) => {
     // owner. They live in a separate /archived list. Non-owners are also
     // restricted to public visibility.
     const filter  = { userId: req.params.userId, status: 'active', isArchived: { $ne: true } };
-    if (!isOwner) filter.visibility = 'public';
+    // Non-owners never see queued/blocked/rejected uploads; the owner sees all
+    // of their own (with a status badge) so they can find the block screen.
+    if (!isOwner) Object.assign(filter, { visibility: 'public' }, PUBLIC_REVIEW_FILTER);
 
     const [videos, total] = await Promise.all([
       Video.find(filter)
@@ -796,13 +1112,18 @@ exports.updateVideo = async (req, res) => {
     if (newsUrl       !== undefined) video.newsUrl       = String(newsUrl).trim().slice(0, 2048);
     if (newsPublisher !== undefined) video.newsPublisher = String(newsPublisher).trim().slice(0, 120);
 
+    // Same folder-scoping rule as createVideo: a publicId outside the owner's
+    // attachments folder is forged and must not be stored (it would later be
+    // renamed/signed/destroyed as if it were this user's asset).
+    const ownAttachment = (pid) =>
+      String(pid || '').startsWith(`truevision/attachments/${req.user.id}/`);
     const sanitizeFiles = (arr) =>
       (Array.isArray(arr) ? arr : [])
         .filter((f) => f && typeof f.url === 'string' && f.url.length > 0)
         .slice(0, 5)
         .map((f) => ({
           url:      String(f.url),
-          publicId: String(f.publicId || ''),
+          publicId: ownAttachment(f.publicId) ? String(f.publicId) : '',
           type:     ['image', 'pdf', 'document'].includes(f.type) ? f.type : 'document',
           name:     String(f.name || '').slice(0, 200),
           size:     Number(f.size) || 0,
@@ -849,13 +1170,24 @@ exports.deleteVideo = async (req, res) => {
         ? deleteFromCloudinary(video.thumbnailPublicId, 'image')
         : Promise.resolve(),
 
-      // sourceFiles + newsFiles — user-attached Cloudinary evidence blobs
-      ...(Array.isArray(video.sourceFiles) ? video.sourceFiles : [])
-        .filter((f) => f && f.publicId)
-        .map((f) => deleteFromCloudinary(f.publicId, f.type === 'image' ? 'image' : 'raw')),
-      ...(Array.isArray(video.newsFiles) ? video.newsFiles : [])
-        .filter((f) => f && f.publicId)
-        .map((f) => deleteFromCloudinary(f.publicId, f.type === 'image' ? 'image' : 'raw')),
+      // sourceFiles + newsFiles — user-attached Cloudinary evidence blobs.
+      // publicId may be absent on legacy rows (derive it from the stored URL,
+      // like getEvidenceFileUrl does) and is only trusted inside the owner's
+      // attachments folder. Raw docs may live as type 'private' (new uploads /
+      // lazily-migrated) or legacy public 'upload' — destroyRawEvidence tries
+      // both and throws on real failures so the cascade logger records them.
+      ...[...(Array.isArray(video.sourceFiles) ? video.sourceFiles : []),
+          ...(Array.isArray(video.newsFiles)   ? video.newsFiles   : [])]
+        .map((f) => {
+          if (!f) return Promise.resolve();
+          const pid = f.publicId || (f.type !== 'image' ? rawPublicIdFromUrl(f.url) : null);
+          if (!pid || !String(pid).startsWith(`truevision/attachments/${String(video.userId)}/`)) {
+            return Promise.resolve();   // no usable owner-scoped reference
+          }
+          return f.type === 'image'
+            ? deleteFromCloudinary(pid, 'image')
+            : destroyRawEvidence(pid);
+        }),
 
       // MongoDB cascades — comments, share log, reposts
       Comment.deleteMany({ videoId }),
@@ -868,7 +1200,9 @@ exports.deleteVideo = async (req, res) => {
       // instead of a broken card pointing at a 404.
       Message.updateMany(
         { videoId },
-        { $set: { videoId: null, type: 'text', content: 'This reel was deleted by its owner.' } },
+        // Field is `text` on the Message schema — `content` would be silently
+        // stripped by strict mode and the tombstone would render empty.
+        { $set: { videoId: null, type: 'text', text: 'This reel was deleted by its owner.' } },
       ),
     ]);
 
@@ -1084,7 +1418,7 @@ exports.searchHashtags = async (req, res) => {
     const rows = await cache.withCache(kHashtag(q, limit), TTL.hashtag, async () => {
       const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
       return Video.aggregate([
-        { $match: { status: 'active', visibility: 'public', isArchived: { $ne: true }, tags: { $exists: true, $ne: [] } } },
+        { $match: { status: 'active', visibility: 'public', isArchived: { $ne: true }, ...PUBLIC_REVIEW_FILTER, tags: { $exists: true, $ne: [] } } },
         { $unwind: '$tags' },
         { $project: { tag: { $toLower: '$tags' } } },
         { $match: { tag: re } },
@@ -1116,9 +1450,11 @@ exports.searchVideos = async (req, res) => {
 
     if (!q) return fail(res, 'Search query is required');
 
-    const regex  = new RegExp(q, 'i');
+    // Escape user input — a raw "(" would throw (500) and crafted patterns
+    // enable ReDoS. Same escape as searchHashtags/searchUsers.
+    const regex  = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
     const filter = {
-      status: 'active', visibility: 'public', isArchived: { $ne: true },
+      status: 'active', visibility: 'public', isArchived: { $ne: true }, ...PUBLIC_REVIEW_FILTER,
       $or: [{ title: regex }, { description: regex }, { tags: regex }],
     };
     if (category && category !== 'all') filter.category = category;
@@ -1311,7 +1647,7 @@ exports.getUserReposts = async (req, res) => {
         .limit(limit)
         .populate({
           path:   'videoId',
-          match:  { status: 'active', isArchived: { $ne: true }, ...(isOwner ? {} : { visibility: 'public' }) },
+          match:  { status: 'active', isArchived: { $ne: true }, ...(isOwner ? {} : { visibility: 'public', ...PUBLIC_REVIEW_FILTER }) },
           select: '-views -notInterested -reports -likes -saves -reposts -favorites',
           populate: { path: 'userId', select: 'username fullName profileImage' },
         })
@@ -1541,7 +1877,7 @@ const buildCollection = (filter) => async (req, res) => {
     // Videos archived by their owner should also disappear from the current
     // user's saved / liked / favorite lists — the video is effectively
     // unavailable until the owner restores it.
-    const query = { ...filter(req.user.id), status: 'active', isArchived: { $ne: true } };
+    const query = { ...filter(req.user.id), status: 'active', isArchived: { $ne: true }, ...PUBLIC_REVIEW_FILTER };
 
     const [videos, total] = await Promise.all([
       Video.find(query)
@@ -1642,6 +1978,47 @@ async function runTranscription(video) {
     }
 
     await Video.updateOne({ _id: video._id }, { $set: set });
+
+    console.log(`[transcription] video=${video._id} lang=${res.language || '?'} empty=${empty} category=${res.category ?? 'none'} confidence=${Number(res.confidence || 0).toFixed(4)} decision=${decision ?? 'none'} chars=${String(res.transcript || '').length}`);
+
+    // ── CONTENT-BASED RE-MODERATION (spec #4) ──────────────────────────────
+    // The synchronous upload check only saw TEXT metadata (title/desc/tags), so
+    // an entertainment video with informative-sounding metadata can slip through
+    // as "approved". Now that we have the SPOKEN content, re-run the SAME
+    // classifier policy on the transcript. If the real content is Entertainment
+    // (or any block category) at/above the block threshold, DOWNGRADE the video.
+    // Rules: only ever make the decision STRICTER (approved → blocked/pending),
+    // never looser; never override a human admin.
+    if (!empty && res.category) {
+      const { decideFromClassifier } = require('../services/moderationPolicy');
+      const moderationService = require('../services/moderationService');
+      const contentVerdict = decideFromClassifier({ category: res.category, confidence: res.confidence });
+      const current = await Video.findById(video._id).select('reviewStatus review').lean();
+      const decidedByAdmin = current?.review?.decidedBy === 'admin';
+      const cur = current?.reviewStatus;
+
+      console.log(`[moderation] transcript re-check video=${video._id} → decision=${contentVerdict.decision} category=${contentVerdict.category} confidence=${Number(contentVerdict.confidence).toFixed(4)} reason=${contentVerdict.reason} | current=${cur} admin=${decidedByAdmin}`);
+
+      const upgrade  = ['pending_review', 'processing'].includes(cur) && contentVerdict.decision !== cur;
+      const downgrade = cur === 'approved' && (contentVerdict.decision === 'blocked' || contentVerdict.decision === 'pending_review');
+
+      if (!decidedByAdmin && (upgrade || downgrade)) {
+        const fresh = await Video.findById(video._id);
+        if (fresh) {
+          const prev = fresh.reviewStatus;
+          moderationService.applyVerdictToDoc(fresh, contentVerdict);
+          await fresh.save();
+          await moderationService.recordAutoDecision(fresh, contentVerdict).catch(() => {});
+          invalidateFeed(); // visibility changed either way → refresh cached feeds
+          if (contentVerdict.decision === 'approved') {
+            console.log(`[feed] PUBLISHED (transcript) video=${video._id} ${prev} → approved (content=${res.category}); feeds/discover/foryou invalidated`);
+          } else {
+            console.log(`[moderation] transcript ${upgrade ? 'RESOLVED' : 'DOWNGRADED'} video=${video._id} ${prev} → ${contentVerdict.decision} (content=${res.category}); feeds invalidated`);
+          }
+        }
+      }
+    }
+
     return res;
   } catch (err) {
     console.error('runTranscription error:', err.message);
@@ -1652,6 +2029,73 @@ async function runTranscription(video) {
         'transcription.transcribedAt': new Date(),
       },
     }).catch(() => {});
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RECOVERY — resolve a video held ONLY because the AI was unavailable.
+//
+// Root-cause fix for "new uploads never leave pending_review". The synchronous
+// upload check fails CLOSED when the AI service is unreachable (reason
+// 'ai-unavailable') or when the metadata was low-confidence — and, previously,
+// nothing ever re-evaluated that video, so it stayed hidden from every feed
+// forever. This function re-runs the REAL BART classification and applies the
+// resulting verdict, publishing (approved) or blocking (entertainment) based
+// purely on the model output — no manual step, no hardcoded ids/categories.
+//
+// Safe by construction:
+//   • only touches videos in a non-terminal AI state (pending_review/processing)
+//   • never overrides an admin decision
+//   • if the AI is STILL unavailable it leaves the video pending (a later
+//     trigger — the async pass, the transcript pass, or the backfill route —
+//     retries), so decisions are always AI-driven, never guessed.
+// Returns the verdict applied, or null if it left the video unchanged.
+// ─────────────────────────────────────────────────────────────────────────────
+async function resolveAutoModeration(video, { text, source = 'retry' } = {}) {
+  try {
+    if (!video) return null;
+    const RECOVERABLE = ['pending_review', 'processing'];
+    if (video.review?.decidedBy === 'admin') return null;      // never override a human
+    if (!RECOVERABLE.includes(video.reviewStatus)) return null; // approved/blocked/rejected are terminal
+
+    const modText = (text && text.trim())
+      ? text.trim().slice(0, 2000)
+      : [video.title, video.description, (video.tags || []).join(' ')].filter(Boolean).join('. ').slice(0, 2000);
+    if (!modText) return null;
+
+    const { decideFromClassifier } = require('../services/moderationPolicy');
+    const moderationService        = require('../services/moderationService');
+
+    console.log(`[moderation] recovery attempt video=${video._id} source=${source} current=${video.reviewStatus} chars=${modText.length}`);
+    const pred = await aiClient.predict(modText);
+    if (pred?.fallback) {
+      console.log(`[moderation] recovery SKIPPED video=${video._id} — AI still unavailable (${pred.error || 'no service'}); stays ${video.reviewStatus}`);
+      return null; // AI down → leave pending; another trigger retries later
+    }
+
+    const verdict = decideFromClassifier({ category: pred?.category, confidence: pred?.confidence });
+    console.log(`[moderation] recovery classified video=${video._id} → category=${verdict.category} confidence=${Number(verdict.confidence).toFixed(4)} decision=${verdict.decision} reason=${verdict.reason}`);
+
+    const prev = video.reviewStatus;
+    moderationService.applyVerdictToDoc(video, verdict);
+    await video.save();
+
+    if (verdict.decision === prev) {
+      console.log(`[moderation] recovery video=${video._id} remains ${verdict.decision} (genuinely uncertain); refreshed confidence`);
+      return verdict;
+    }
+
+    await moderationService.recordAutoDecision(video, verdict).catch(() => {});
+    if (verdict.decision === 'approved') {
+      invalidateFeed(); // publish everywhere at once (feed + discover + foryou pools)
+      console.log(`[feed] PUBLISHED (recovery/${source}) video=${video._id} ${prev} → approved; feeds/discover/foryou invalidated → visible to everyone`);
+    } else {
+      console.log(`[moderation] recovery video=${video._id} ${prev} → ${verdict.decision} (${verdict.reason})`);
+    }
+    return verdict;
+  } catch (e) {
+    console.error('resolveAutoModeration error:', e.message);
     return null;
   }
 }
@@ -1684,6 +2128,15 @@ async function runContentAnalysis(video) {
     video.rankingUpdatedAt = new Date();
 
     await video.save();
+    console.log(`[recommendation] video=${video._id} ranking updated rankingScore=${Number(video.rankingScore || 0).toFixed(3)} informativeScore=${video.informativeScore} aiCategory=${video.aiCategory || 'n/a'}`);
+
+    // ── RECOVERY (root-cause fix) ──────────────────────────────────────────
+    // If the synchronous upload decision failed closed (AI was unavailable) or
+    // was low-confidence, the video is stuck in pending_review and hidden from
+    // every feed. Re-run the REAL classification now and publish/block on the
+    // model's output. No-op for already approved/blocked/admin-decided videos.
+    await resolveAutoModeration(video, { source: 'post-upload' }).catch((e) =>
+      console.error('resolveAutoModeration(post-upload) error:', e.message));
 
     return scores;
   } catch (err) {
@@ -1709,7 +2162,7 @@ async function runContentAnalysis(video) {
 // ─────────────────────────────────────────────────────────────────────────────
 exports.recomputeRankings = async (req, res) => {
   try {
-    if (req.user?.role !== 'admin') return fail(res, 'Admin only', 403);
+    if (!req.admin && req.user?.role !== 'admin') return fail(res, 'Admin only', 403);
 
     const useAi = String(req.query.ai || 'false') === 'true';
     const videos = await Video.find({ status: 'active' });
@@ -1746,5 +2199,46 @@ exports.recomputeRankings = async (req, res) => {
   } catch (err) {
     console.error('recomputeRankings error:', err);
     return fail(res, 'Recompute failed', 500);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADMIN — re-moderate every video stuck in pending_review / processing
+// POST /api/videos/admin/remoderate-pending
+//
+// Recovery backfill: resolves videos that were held ONLY because the AI service
+// was unavailable at upload time (reason 'ai-unavailable') or were low-confidence.
+// Re-runs the REAL classification on each and publishes/blocks on the model's
+// output. Run this once after (re)starting the AI service to un-stick any
+// already-uploaded videos. Idempotent; never touches admin-decided videos.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.remoderatePending = async (req, res) => {
+  try {
+    if (!req.admin && req.user?.role !== 'admin') return fail(res, 'Admin only', 403);
+
+    const videos = await Video.find({
+      status: 'active',
+      reviewStatus: { $in: ['pending_review', 'processing'] },
+      'review.decidedBy': { $ne: 'admin' },
+    });
+
+    console.log(`[backfill] remoderate-pending: ${videos.length} candidate videos`);
+    let approved = 0, blocked = 0, stillPending = 0, skipped = 0;
+    for (const v of videos) {
+      const verdict = await resolveAutoModeration(v, { source: 'backfill' });
+      if (!verdict)                             skipped++;
+      else if (verdict.decision === 'approved') approved++;
+      else if (verdict.decision === 'blocked')  blocked++;
+      else                                       stillPending++;
+    }
+    console.log(`[backfill] done: approved=${approved} blocked=${blocked} stillPending=${stillPending} skipped=${skipped}`);
+
+    return ok(res, {
+      message: `Re-moderated ${videos.length} pending video(s)`,
+      total: videos.length, approved, blocked, stillPending, skipped,
+    });
+  } catch (err) {
+    console.error('remoderatePending error:', err);
+    return fail(res, 'Re-moderation failed', 500);
   }
 };

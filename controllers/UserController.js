@@ -110,17 +110,58 @@ exports.searchUsers = async (req, res) => {
       ? { username: 1 }
       : { lastSeen: -1, createdAt: -1 };
 
-    // `preferences` is selected ONLY so applyPresencePolicy can consult
-    // hideOnlineStatus — the policy helper strips it before it reaches the wire.
+    // `preferences` feeds applyPresencePolicy (hideOnlineStatus) and the
+    // private-account flag; followers/following/followRequests are selected so
+    // the counts + viewer-relative follow state can be computed off the doc
+    // itself (no per-user round-trips). The policy helper strips `preferences`
+    // before it reaches the wire, and we whitelist the response fields below so
+    // the raw social-graph arrays never leak.
     const users = await User.find(filter)
-      .select('fullName username profileImage bio isVerified isOnline lastSeen preferences')
+      .select('fullName username profileImage bio isVerified isOnline lastSeen preferences followers following followRequests')
       .sort(sort)
       .limit(q.length > 0 ? 20 : 30)
       .lean();
 
-    return ok(res, {
-      users: users.map((u) => privacy.applyPresencePolicy(u, req.user.id)),
+    // Public video count per result in ONE aggregation (avoids an N+1 of
+    // countDocuments calls). Mirrors getMe's `status !== 'deleted'` rule.
+    const meId = String(req.user.id);
+    const ids  = users.map((u) => u._id);
+    const counts = ids.length
+      ? await Video.aggregate([
+          { $match: { userId: { $in: ids }, status: { $ne: 'deleted' } } },
+          { $group: { _id: '$userId', n: { $sum: 1 } } },
+        ])
+      : [];
+    const videoCountOf = new Map(counts.map((c) => [String(c._id), c.n]));
+
+    // Enrich each row with the fields the Discover search cards render:
+    // counts + viewer-relative follow state. Backward-compatible — every
+    // previously returned field (fullName, username, profileImage, bio,
+    // isVerified, isOnline, lastSeen) is preserved; `displayName` mirrors
+    // `fullName` for the new UI.
+    const enriched = users.map((u) => {
+      const presence  = privacy.applyPresencePolicy(u, req.user.id);
+      const followers = u.followers || [];
+      return {
+        _id:            presence._id,
+        fullName:       presence.fullName,
+        displayName:    presence.fullName,
+        username:       presence.username,
+        profileImage:   presence.profileImage || null,
+        bio:            presence.bio || '',
+        isVerified:     !!presence.isVerified,
+        isOnline:       !!presence.isOnline,
+        lastSeen:       presence.lastSeen ?? null,
+        followersCount: followers.length,
+        followingCount: (u.following || []).length,
+        videosCount:    videoCountOf.get(String(u._id)) || 0,
+        isFollowing:    followers.some((f) => String(f) === meId),
+        isRequested:    (u.followRequests || []).some((r) => String(r.from) === meId),
+        isPrivate:      !!u.preferences?.privacy?.privateAccount,
+      };
     });
+
+    return ok(res, { users: enriched });
   } catch (err) {
     console.error('searchUsers error:', err);
     return fail(res, 'Search failed', 500);

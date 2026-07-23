@@ -156,7 +156,8 @@ const videoSchema = new mongoose.Schema({
     '240p': { type: String, default: '' },
     '360p': { type: String, default: '' },
     '480p': { type: String, default: '' },
-    '720p': { type: String, default: '' },
+    '720p':  { type: String, default: '' },
+    '1080p': { type: String, default: '' },   // on-demand HD rung (Wi-Fi only client-side)
   },
 
   // ── Pinned Comment ────────────────────────────────────────────────────────
@@ -221,6 +222,39 @@ const videoSchema = new mongoose.Schema({
   rankingScore:     { type: Number, default: 0, index: true },       // weighted combo; sorted DESC for trending
   aiAnalyzedAt:     { type: Date,   default: null },                  // last time AI classifier ran
   rankingUpdatedAt: { type: Date,   default: null },                  // last time engagement → ranking ran
+
+  // ── AI MODERATION QUEUE (informative-first publishing) ────────────────────
+  // Every NEW upload enters here as 'processing' and is NOT publicly visible.
+  // The async classifier + services/moderationPolicy.js then set:
+  //   approved          → publicly visible (informative/professional/Islamic…)
+  //   blocked           → hidden; entertainment/music/comedy/…; creator sees a
+  //                       block screen and may Request Review
+  //   pending_review    → hidden; classifier unavailable/uncertain → manual
+  //   rejected          → hidden; an admin rejected a review request
+  //   changes_requested → hidden; admin asked the creator to improve + re-upload
+  //
+  // BACK-COMPAT: legacy videos have NO reviewStatus field. Public queries use
+  // `$nin: HIDDEN_REVIEW_STATES` so those legacy docs (field absent) stay
+  // visible. Only explicitly-queued states are hidden.
+  reviewStatus: {
+    type:    String,
+    enum:    ['processing', 'approved', 'blocked', 'pending_review', 'rejected', 'changes_requested'],
+    default: 'approved',   // explicit 'processing' is set on new uploads
+    index:   true,
+  },
+  review: {
+    // The moderation category the auto-decision was based on + its confidence.
+    autoCategory:   { type: String, default: null },
+    confidence:     { type: Number, default: 0, min: 0, max: 1 },
+    decision:       { type: String, default: null },   // mirrors the last policy decision
+    reason:         { type: String, default: '' },     // machine reason, e.g. non-informative-category:music
+    decidedBy:      { type: String, enum: ['ai', 'admin', null], default: null },
+    decidedByAdmin: { type: mongoose.Schema.Types.ObjectId, ref: 'AdminUser', default: null },
+    decidedAt:      { type: Date, default: null },
+    // Admin feedback shown to the creator on reject / request-changes.
+    adminNote:      { type: String, default: '' },
+    queuedAt:       { type: Date, default: null },      // when it entered the queue
+  },
 
   // ── Reports ───────────────────────────────────────────────────────────────
   reports:      [reportSchema],
@@ -312,6 +346,13 @@ videoSchema.index({ likesCount: -1 });
 // archive count grows.
 videoSchema.index({ status: 1, isArchived: 1, visibility: 1, createdAt: -1 });
 videoSchema.index({ userId: 1, isArchived: 1, createdAt: -1 });
+// Admin moderation queue: list by review state, newest first.
+videoSchema.index({ reviewStatus: 1, createdAt: -1 });
+// Saved / Liked / Favorites collection screens query by membership in these
+// arrays — multikey indexes turn full collection scans into index lookups.
+videoSchema.index({ saves: 1, createdAt: -1 });
+videoSchema.index({ likes: 1, createdAt: -1 });
+videoSchema.index({ favorites: 1, createdAt: -1 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INSTANCE HELPERS

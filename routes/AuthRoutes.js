@@ -21,9 +21,14 @@ router.post('/2fa-resend', authController.twoFactorResend);
 // the refresh token and mints a new short-lived access token.
 router.post('/refresh', authController.refresh);
 
-// SMTP diagnostic — leave mounted while you're stabilising email transport;
-// remove or guard with an admin role before going to production.
-router.get('/test-email', authController.testEmail);
+// SMTP diagnostic — leave mounted while you're stabilising email transport.
+// TODO (production): remove this route or guard it behind an admin role before
+// release — it can send email unauthenticated. Useful during development.
+// Dev-only SMTP diagnostic. Unauthenticated email-sending + config detail
+// leak in production, so it is not mounted there at all (404).
+if (process.env.NODE_ENV !== 'production') {
+  router.get('/test-email', authController.testEmail);
+}
 router.post('/forgot-password', authController.forgotPassword);
 router.post('/reset-password', authController.resetPassword);
 

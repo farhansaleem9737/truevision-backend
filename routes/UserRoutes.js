@@ -27,6 +27,7 @@ const {
   blockUser,
   unblockUser,
   listBlockedUsers,
+  reportUser,
 } = require('../controllers/SocialController');
 
 // ── Search ────────────────────────────────────────────────────────────────────
@@ -94,6 +95,9 @@ router.get('/:userId/following', protect, listFollowing);
 // DELETE /api/users/:userId/block     — unblock
 router.post  ('/:userId/block', protect, blockUser);
 router.delete('/:userId/block', protect, unblockUser);
+
+// POST /api/users/:userId/report      — file a moderation report against a user
+router.post('/:userId/report', protect, reportUser);
 
 // ── Push notifications ────────────────────────────────────────────────────────
 // POST /api/users/push-token     — register the current device's Expo/FCM token
